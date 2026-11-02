@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.5.0
+- **Server logic.** `authority.onChange(pattern, handler)` registers change handlers for wildcard paths that apply, adjust or reject a client change, with the stale flag and the changes since its base; `adjusted` acks carry the value. `authority.write` makes server writes at the next revision, pushed to every client; writes under `$.server` are kept and saved without a revision and never leave the authority. `authority.onEmit` hands client emits to the app server, and `authority.emit` sends one to every client (AMM-1815).
+
 ## 0.4.0
 - **Authority.** `@punyts/state-sync/authority`: `createAuthority` owns a namespace's order of changes. It answers `hello` with the logged changes or a snapshot, applies each change at the next revision in arrival order, acks it, pushes it to the other connections, applies a repeated change id once, rejects changes under `$.server` or a missing parent, and saves the state, revision, log and applied ids through the `NamespaceStorage` port (`createMemoryNamespaceStorage` for tests). Connections come in through `authority.connect({ send, close })` (AMM-1814).
 

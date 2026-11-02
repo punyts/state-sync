@@ -3,10 +3,11 @@ import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "../Apply.js";
 import type { Change, JsonValue, RevisedChange } from "../Change.js";
 import type { AckMessage, HelloMessage, SyncMessage } from "../Messages.js";
-import { SERVER_PATH, isAtOrBelow } from "../Paths.js";
+import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
+import { touchesPattern } from "./Patterns.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
 export type AuthorityErrorCode = "wrong-namespace" | "no-hello";
@@ -37,12 +38,57 @@ export interface AuthorityOptions {
     limits?: Partial<SyncLimits>;
 }
 
+/** What a change handler gets */
+export interface ChangeContext {
+    /** The client's change, as adjusted by the handlers before this one */
+    change: Change;
+    /** The client id of the hello on the change's connection */
+    clientId: string;
+    /** A copy of the value at a path of the current state, $.server included */
+    get: (path: string) => JsonValue | undefined;
+    /** One of the changes since the change's base is at, above or below its path, or the base is older than the log */
+    stale: boolean;
+    /** The logged changes after the change's base, oldest first */
+    since: RevisedChange[];
+}
+
+/** A handler's answer; undefined applies the change */
+export type ChangeVerdict =
+    | { result: "apply" }
+    | { result: "adjust"; value: JsonValue }
+    | { result: "reject"; reason: string }
+    | undefined;
+
+/** Server logic for client changes; synchronous, so changes stay in arrival order */
+export type ChangeHandler = (context: ChangeContext) => ChangeVerdict;
+
+/** Server logic for a client's emit */
+export type EmitHandler = (name: string, value: JsonValue | undefined, clientId: string) => void;
+
+/** A write made by server logic */
+export type ServerWrite = Pick<Change, "path" | "op" | "value">;
+
 export interface Authority {
     readonly namespace: string;
     /** Takes a client connection; the caller passes its messages and its close to the session */
     connect: (connection: AuthorityConnection) => AuthoritySession;
+    /**
+     * Registers server logic for client changes at, below or above the paths a pattern matches ("*" matches one
+     * segment); returns the function that removes it
+     */
+    onChange: (pattern: string, handler: ChangeHandler) => () => void;
+    /** Registers server logic for client emits; returns the function that removes it */
+    onEmit: (handler: EmitHandler) => () => void;
+    /**
+     * A server write: applied at once and pushed to every client with the next revision, which it returns. A write at or
+     * below $.server is applied and saved only: it takes no revision and never reaches a client. Throws for a path that
+     * is not a sync path or whose parent does not exist.
+     */
+    write: (write: ServerWrite) => number | undefined;
+    /** Sends a named event to every welcomed client */
+    emit: (name: string, value?: JsonValue) => void;
     revision: () => number;
-    /** A copy of the whole state */
+    /** A copy of the whole state, $.server included */
     state: () => { [key: string]: JsonValue };
     /** Resolves when every pending save is done */
     flush: () => Promise<void>;
@@ -54,6 +100,12 @@ interface Session {
     connection: AuthorityConnection;
     /** Answered with welcome; only welcomed sessions get changes */
     welcomed: boolean;
+    clientId: string;
+}
+
+interface RegisteredHandler {
+    pattern: string;
+    handler: ChangeHandler;
 }
 
 /** The parent of a "$."-prefixed path; "$" for a top-level path */
@@ -63,8 +115,9 @@ const isComposite = (value: unknown) => typeof value === "object" && value !== n
 
 /**
  * The authority of a namespace: it numbers each change it accepts with the next revision, acks it, pushes it to the
- * other clients and catches reconnecting clients up from its log or with a snapshot. Without server logic a change is
- * applied in arrival order, stale or not.
+ * other clients and catches reconnecting clients up from its log or with a snapshot. Change handlers (server logic) can
+ * apply, adjust or reject a change; without them a change is applied in arrival order, stale or not. $.server never
+ * leaves the authority.
  * @param options
  */
 export const createAuthority = async (options: AuthorityOptions): Promise<Authority> => {
@@ -81,6 +134,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const applied = new Map<string, number>((stored?.applied ?? []).map(({ id, revision }) => [id, revision]));
 
     const sessions = new Set<Session>();
+    const handlers: RegisteredHandler[] = [];
+    const emitHandlers = new Set<EmitHandler>();
 
     let dirty = false;
     let saving: Promise<void> = Promise.resolve();
@@ -150,33 +205,21 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             ? { type: "welcome", namespace, revision, changes: log.slice(log.length - missing) }
             : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store) });
         session.welcomed = true;
+        session.clientId = hello.clientId;
     };
 
     const ack = (session: Session, message: Omit<AckMessage, "type">) => send(session, { type: "ack", ...message });
 
-    /** Why a change cannot be applied, or undefined when it can */
-    const refusal = (change: Change): string | undefined => {
-        if (isAtOrBelow(change.path, SERVER_PATH)) {
-            return `${SERVER_PATH} is server-only`;
-        }
+    /** Why the change cannot be applied to the store, or undefined when it can */
+    const missingParent = (change: Pick<Change, "path" | "op">): string | undefined => {
         const parent = parentOf(change.path);
-        if (change.op !== "delete" && parent !== "$" && !isComposite(store.get(parent))) {
-            return `${parent} does not exist`;
-        }
-        return undefined;
+        return change.op !== "delete" && parent !== "$" && !isComposite(store.get(parent))
+            ? `${parent} does not exist`
+            : undefined;
     };
 
-    const onChange = (session: Session, change: Change) => {
-        const known = applied.get(change.id);
-        if (known !== undefined) {
-            ack(session, { id: change.id, result: "applied", revision: known });
-            return;
-        }
-        const reason = refusal(change);
-        if (reason !== undefined) {
-            ack(session, { id: change.id, result: "rejected", reason });
-            return;
-        }
+    /** Applies an accepted change at the next revision, logs it and pushes it to every welcomed session but the writer */
+    const commit = (change: Change, writer?: Session): number => {
         applyChange(store, change);
         revision++;
         const revised: RevisedChange = { ...copyJson<Change>(change), revision };
@@ -184,15 +227,90 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         if (log.length > logLength) {
             log.splice(0, log.length - logLength);
         }
-        applied.set(change.id, revision);
+        scheduleSave();
+        for (const other of sessions) {
+            if (other !== writer && other.welcomed) {
+                send(other, { type: "changes", changes: [revised] });
+            }
+        }
+        return revision;
+    };
+
+    /** Runs the handlers that touch the change in registration order: the change as adjusted, or the first rejection */
+    const runHandlers = (session: Session, received: Change): { change: Change; adjusted: boolean } | { reason: string } => {
+        let change = received;
+        let adjusted = false;
+        const since = log.filter((logged) => logged.revision > received.base);
+        const stale = received.base < revision - log.length ||
+            since.some((logged) => isAtOrBelow(logged.path, received.path) || isAtOrBelow(received.path, logged.path));
+        for (const { pattern, handler } of [...handlers]) {
+            if (!touchesPattern(pattern, received.path)) {
+                continue;
+            }
+            let verdict: ChangeVerdict;
+            try {
+                verdict = handler({
+                    change: copyJson<Change>(change),
+                    clientId: session.clientId,
+                    get: (path) => copyJson(store.get(path)),
+                    stale,
+                    since: copyJson<RevisedChange[]>(since)
+                });
+            }
+            catch (error) {
+                report("state-sync", "A change handler for %s in %s failed: %s", [pattern, namespace, error instanceof Error ? error.message : String(error)]);
+                return { reason: "server logic failed" };
+            }
+            if (verdict?.result === "reject") {
+                return { reason: verdict.reason };
+            }
+            if (verdict?.result === "adjust") {
+                change = { ...change, op: "set", value: copyJson(verdict.value) };
+                adjusted = true;
+            }
+        }
+        return { change, adjusted };
+    };
+
+    const onChange = (session: Session, received: Change) => {
+        const known = applied.get(received.id);
+        if (known !== undefined) {
+            ack(session, { id: received.id, result: "applied", revision: known });
+            return;
+        }
+        if (isAtOrBelow(received.path, SERVER_PATH)) {
+            ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
+            return;
+        }
+        const outcome = runHandlers(session, received);
+        if ("reason" in outcome) {
+            ack(session, { id: received.id, result: "rejected", reason: outcome.reason });
+            return;
+        }
+        const { change, adjusted } = outcome;
+        //checked after the handlers: an adjust turns a delete into a set
+        const missing = missingParent(change);
+        if (missing !== undefined) {
+            ack(session, { id: received.id, result: "rejected", reason: missing });
+            return;
+        }
+        const at = commit(change, session);
+        applied.set(change.id, at);
         if (applied.size > appliedLength) {
             applied.delete(applied.keys().next().value!);
         }
-        scheduleSave();
-        ack(session, { id: change.id, result: "applied", revision });
-        for (const other of sessions) {
-            if (other !== session && other.welcomed) {
-                send(other, { type: "changes", changes: [revised] });
+        ack(session, adjusted
+            ? { id: change.id, result: "adjusted", revision: at, value: copyJson(change.value) }
+            : { id: change.id, result: "applied", revision: at });
+    };
+
+    const onEmit = (session: Session, name: string, value: JsonValue | undefined) => {
+        for (const handler of [...emitHandlers]) {
+            try {
+                handler(name, copyJson(value), session.clientId);
+            }
+            catch (error) {
+                report("state-sync", "An emit handler for %s in %s failed: %s", [name, namespace, error instanceof Error ? error.message : String(error)]);
             }
         }
     };
@@ -218,19 +336,25 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 }
                 onChange(session, message.change);
                 return;
+            case "emit":
+                if (!session.welcomed) {
+                    refuse(session, "no-hello", "send hello first", false);
+                    return;
+                }
+                onEmit(session, message.name, message.value);
+                return;
             case "error":
                 report("state-sync", "A client of %s sent an error: %s %s", [namespace, message.code, message.message]);
                 return;
             default:
-                //emit and server logic come with S1.6
-                return;
+                report("state-sync", "Ignoring a %s message from a client of %s", [message.type, namespace]);
         }
     };
 
     return {
         namespace,
         connect: (connection) => {
-            const session: Session = { connection, welcomed: false };
+            const session: Session = { connection, welcomed: false, clientId: "" };
             sessions.add(session);
             return {
                 receive: (text) => receive(session, text),
@@ -238,6 +362,48 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                     sessions.delete(session);
                 }
             };
+        },
+        onChange: (pattern, handler) => {
+            const registered: RegisteredHandler = { pattern, handler };
+            handlers.push(registered);
+            return () => {
+                const index = handlers.indexOf(registered);
+                if (index >= 0) {
+                    handlers.splice(index, 1);
+                }
+            };
+        },
+        onEmit: (handler) => {
+            emitHandlers.add(handler);
+            return () => {
+                emitHandlers.delete(handler);
+            };
+        },
+        write: (write) => {
+            if (!isSyncPath(write.path)) {
+                throw new Error(`${write.path} is not a sync path`);
+            }
+            const missing = missingParent(write);
+            if (missing !== undefined) {
+                throw new Error(missing);
+            }
+            if (isAtOrBelow(write.path, SERVER_PATH)) {
+                //server-only: no revision, so clients never see a gap
+                applyChange(store, write);
+                scheduleSave();
+                return undefined;
+            }
+            const change: Change = write.value === undefined
+                ? { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, base: revision }
+                : { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, value: copyJson(write.value), base: revision };
+            return commit(change);
+        },
+        emit: (name, value) => {
+            for (const session of sessions) {
+                if (session.welcomed) {
+                    send(session, value === undefined ? { type: "emit", name } : { type: "emit", name, value });
+                }
+            }
         },
         revision: () => revision,
         state: () => copyJson(store.get("$")),

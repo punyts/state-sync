@@ -177,6 +177,38 @@ wss.on("connection", (socket) => {
 - `authority.revision()`, `authority.state()` (a copy, `$.server` included) and `authority.close()` (closes every
   connection).
 
+### Server logic
+
+```ts
+authority.onChange("$.data.expenses.*", ({ change, get, stale, since, clientId }) => {
+    if (change.value.amount < 0) {
+        return { result: "reject", reason: "amount must be positive" };
+    }
+    return { result: "adjust", value: { ...change.value, amount: Math.round(change.value.amount) } };
+});
+authority.onEmit((name, value, clientId) => { /* an app event, not a change */ });
+authority.write({ path: "$.data.total", op: "set", value: 42 });   // revision 43, pushed to every client
+authority.write({ path: "$.server.token", op: "set", value: token });   // kept and saved, never sent
+authority.emit("notice", { text: "saved" });
+```
+
+- **Change handlers** are called for a client change at, below or above a path their pattern matches (`*` matches one
+  segment). They get a copy of the change as adjusted so far, the client id, `get(path)` for a copy of the current state,
+  `since` (the logged changes after the change's base) and `stale` (one of those is at, above or below the change's
+  path, or the base is older than the log). They return `undefined` or `{ result: "apply" }`, `{ result: "adjust",
+  value }` or `{ result: "reject", reason }`. Handlers run in registration order and are synchronous, so changes stay
+  in arrival order. The first reject wins; an adjust makes the change a `set` of the value, acked `adjusted` with it and
+  pushed with it. A handler that throws rejects the change (`server logic failed`). `onChange` returns the function
+  that removes the handler.
+- **Server writes** (`write`) go to any sync path at any time and are not passed to handlers; they may be made from a
+  handler. A write outside `$.server` gets the next revision, is logged and pushed to every client, and `write` returns
+  the revision. A path that is not a sync path or whose parent does not exist throws.
+- **`$.server`** never leaves the authority: a client change at or below it is rejected before any handler runs, and a
+  server write under it is applied and saved but takes no revision, so it is never logged, pushed or in a `welcome`,
+  and clients see no revision gap. Snapshots leave it out.
+- **Emit.** A client's `emit` (after `hello`) is handed to each `onEmit` handler with the client id and is not a change;
+  a throwing handler is reported. `authority.emit(name, value?)` sends an `emit` to every welcomed client.
+
 ## Tests
 
 `npm test` runs the unit tests in Node; `npm run test:browser` runs `*.browser.test.ts` in headless Chromium
