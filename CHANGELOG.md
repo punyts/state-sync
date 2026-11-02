@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Docs: the README describes the three modes (Standalone, Persisted, Full) and has security notes (AMM-1822).
+
 ## 0.7.0
 - **Sparse states.** `applyChange` creates missing parents as empty objects for a set, replace or merge (a merge with nothing to merge into sets), and a delete below a missing parent does nothing. `createAuthority({ createParents: true })` accepts client changes and server writes below a missing parent instead of rejecting them, for states that hold only what a user changed, such as the articulation of `$.app` (AMM-1819).
 

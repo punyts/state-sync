@@ -4,6 +4,21 @@ State sync for `@punyts/state`: the change, the messages of the sync protocol wi
 turns a store's own writes into changes, and the snapshot a store syncs from. Clients, authorities, the runtime and the
 statenet build on it. It has no transport, storage, DOM or Node dependency.
 
+## Modes
+
+An app runs in one of three modes; the mode decides which store is the authority, the one whose order of changes is
+final.
+
+| Mode | Authority | What runs | Persistence |
+|---|---|---|---|
+| Standalone | The browser store | A sync client with no transport | The browser's local store only |
+| Persisted | A statenet namespace | A sync client connected to [`@punyts/statenet`](https://github.com/punyts/statenet) | The statenet, plus the local store |
+| Full | An app server's authority | A sync client connected to an app server that runs `createAuthority` with server logic | The app server's storage (or a statenet it relays to), plus the local store |
+
+The protocol is the same everywhere: a browser speaks it to a statenet or an app server, and an app server speaks it
+again, as a client, to a statenet. In every mode the app opens from the local store at once and takes changes offline;
+they are sent in order when the connection is back, and the authority's answer is final.
+
 ## Changes
 
 ```ts
@@ -229,6 +244,21 @@ const authority = await createAuthority({ namespace, storage, serverKey: Buffer.
 - `encryptServerBranch` and `decryptServerBranch` are exported for a relay that forwards `$.server` (S1.12).
 - **Emit.** A client's `emit` (after `hello`) is handed to each `onEmit` handler with the client id and is not a change;
   a throwing handler is reported. `authority.emit(name, value?)` sends an `emit` to every welcomed client.
+
+## Security notes
+
+- **`$.server` never leaves the authority.** It is never in a snapshot, a change, an ack or an emit to a client;
+  a client change at or below `$.server` is rejected. With a `serverKey` it is stored encrypted (AES-256-GCM per
+  child, the namespace and name as additional data); without one the authority keeps none. Keep the key outside the
+  stored data.
+- **Local storage holds only what a browser may see**: the confirmed state, the outbox and the document. Anyone with
+  access to the browser profile can read it, so do not put secrets in synced state.
+- **Messages are validated** (`parseMessage`): size, shape and paths, with `__proto__` and the like refused, before
+  an authority or a client acts on them. Change ids are bounded and applied at most once per namespace.
+- **No authentication in the protocol.** Whoever can open the transport can read and write the namespace; the transport
+  decides who may connect (`@punyts/statenet` listens on loopback only and checks `Host` and `Origin`).
+- **Logging** goes through the `@punyts/core` reporter with namespaces, revisions and counts, never change values or
+  keys.
 
 ## Tests
 
