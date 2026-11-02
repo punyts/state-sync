@@ -109,7 +109,7 @@ describe("createAuthority", () => {
         });
 
         it("should keep $.runtime and $.server out of a snapshot", async () => {
-            const { join } = await setup({ initial: { data: { total: 1 }, server: { key: "secret" } } });
+            const { join } = await setup({ initial: { data: { total: 1 }, server: { key: "secret" } }, serverKey: new Uint8Array(32) });
 
             const { received } = join(0);
 

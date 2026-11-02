@@ -144,7 +144,7 @@ client.start();
 ## Authority
 
 `@punyts/state-sync/authority` is the side that owns a namespace's order of changes, for Node (an app server, the
-statenet). It uses no browser or Node-only globals and is a separate entry, so a client bundle never includes it.
+statenet). It is a separate entry, so a client bundle never includes it; it uses `node:crypto` for `$.server`.
 
 ```ts
 import { createAuthority, createMemoryNamespaceStorage } from "@punyts/state-sync/authority";
@@ -206,6 +206,25 @@ authority.emit("notice", { text: "saved" });
 - **`$.server`** never leaves the authority: a client change at or below it is rejected before any handler runs, and a
   server write under it is applied and saved but takes no revision, so it is never logged, pushed or in a `welcome`,
   and clients see no revision gap. Snapshots leave it out.
+
+### `$.server` at rest
+
+```ts
+const authority = await createAuthority({ namespace, storage, serverKey: Buffer.from(process.env.SERVER_KEY!, "base64") });
+```
+
+- **Encrypted per value.** On every save each direct child of `$.server` is stored as
+  `punyts-enc:v1:<base64 of nonce, ciphertext and tag>`: AES-256-GCM with a fresh 12-byte nonce and the 32-byte
+  `serverKey`, with `<namespace>:<name>` as additional data, so a value copied to another name or namespace does not
+  decrypt. Loading decrypts it; a wrong key, tampered data or an unencrypted value throws
+  `Could not decrypt $.server.<name> of <namespace>: …` and the authority is not created, instead of loading garbage.
+- **No key, no `$.server`.** Without `serverKey` a server write at or below `$.server` throws, and a stored or
+  `initial` state with `$.server` is refused, so nothing is ever saved in plaintext. `$.server` itself must be an
+  object of named values.
+- **The key stays in memory.** It is never put in the state, the stored namespace or a report. `@punyts/state` reports
+  written values under its `state-set-extended` category, so an app server holding secrets does not enable that
+  category (or `all`) for a listener that writes to a log.
+- `encryptServerBranch` and `decryptServerBranch` are exported for a relay that forwards `$.server` (S1.12).
 - **Emit.** A client's `emit` (after `hello`) is handed to each `onEmit` handler with the client id and is not a change;
   a throwing handler is reported. `authority.emit(name, value?)` sends an `emit` to every welcomed client.
 

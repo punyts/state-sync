@@ -8,6 +8,7 @@ import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
 import { touchesPattern } from "./Patterns.js";
+import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
 export type AuthorityErrorCode = "wrong-namespace" | "no-hello";
@@ -36,6 +37,12 @@ export interface AuthorityOptions {
     /** The most recent applied change ids remembered; 10000 by default, never fewer than the log */
     appliedLength?: number;
     limits?: Partial<SyncLimits>;
+    /**
+     * The 32-byte key $.server is encrypted with at rest (AES-256-GCM, a fresh nonce per value), from configuration;
+     * never stored or logged. Without it the authority keeps no $.server: a server write there throws, and a stored or
+     * initial state with one is refused
+     */
+    serverKey?: Uint8Array;
 }
 
 /** What a change handler gets */
@@ -113,6 +120,17 @@ const parentOf = (path: string) => path.slice(0, path.lastIndexOf("."));
 
 const isComposite = (value: unknown) => typeof value === "object" && value !== null;
 
+/** The key of $.server in the state */
+const SERVER_KEY = SERVER_PATH.slice(2);
+
+/** The $.server value as the object of named values it must be, encrypted one by one */
+const serverBranch = (value: JsonValue | undefined, namespace: string): { [name: string]: JsonValue } => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${SERVER_PATH} of ${namespace} must be an object of named values`);
+    }
+    return value;
+};
+
 /**
  * The authority of a namespace: it numbers each change it accepts with the next revision, acks it, pushes it to the
  * other clients and catches reconnecting clients up from its log or with a snapshot. Change handlers (server logic) can
@@ -126,8 +144,21 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const appliedLength = Math.max(logLength, options.appliedLength ?? 10_000);
     const limits: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...options.limits };
 
+    const { serverKey } = options;
     const stored = await storage.load(namespace);
-    const store: Store<any> = createStore(copyJson(stored?.state ?? options.initial ?? {}));
+    const state = copyJson<{ [key: string]: JsonValue }>(stored?.state ?? options.initial ?? {});
+    if (state[SERVER_KEY] !== undefined) {
+        if (serverKey === undefined) {
+            throw new Error(`The state of ${namespace} has ${SERVER_PATH}, but the authority has no serverKey`);
+        }
+        if (stored !== undefined) {
+            state[SERVER_KEY] = decryptServerBranch(serverBranch(state[SERVER_KEY], namespace), serverKey, namespace);
+        }
+        else {
+            serverBranch(state[SERVER_KEY], namespace);
+        }
+    }
+    const store: Store<any> = createStore(state);
     let revision = stored?.revision ?? 0;
     const log: RevisedChange[] = (stored?.log ?? []).slice(-logLength);
     //insertion order is the order the ids were applied in
@@ -141,12 +172,19 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     let saving: Promise<void> = Promise.resolve();
     let saveScheduled = false;
 
-    const storedNamespace = (): StoredNamespace => ({
-        state: copyJson(store.get("$")),
-        revision,
-        log: copyJson<RevisedChange[]>(log),
-        applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision }))
-    });
+    const storedNamespace = (): StoredNamespace => {
+        const state = copyJson<{ [key: string]: JsonValue }>(store.get("$"));
+        if (state[SERVER_KEY] !== undefined && serverKey !== undefined) {
+            //$.server is only ever saved encrypted
+            state[SERVER_KEY] = encryptServerBranch(serverBranch(state[SERVER_KEY], namespace), serverKey, namespace);
+        }
+        return {
+            state,
+            revision,
+            log: copyJson<RevisedChange[]>(log),
+            applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision }))
+        };
+    };
 
     const save = async () => {
         if (!dirty) {
@@ -383,11 +421,18 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             if (!isSyncPath(write.path)) {
                 throw new Error(`${write.path} is not a sync path`);
             }
+            const server = isAtOrBelow(write.path, SERVER_PATH);
+            if (server && serverKey === undefined) {
+                throw new Error(`${SERVER_PATH} needs a serverKey, so it is never stored in plaintext`);
+            }
             const missing = missingParent(write);
             if (missing !== undefined) {
                 throw new Error(missing);
             }
-            if (isAtOrBelow(write.path, SERVER_PATH)) {
+            if (server) {
+                if (write.path === SERVER_PATH && write.op !== "delete") {
+                    serverBranch(write.value, namespace);
+                }
                 //server-only: no revision, so clients never see a gap
                 applyChange(store, write);
                 scheduleSave();

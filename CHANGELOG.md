@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.6.0
+- **`$.server` encryption at rest.** `createAuthority({ serverKey })` saves each direct child of `$.server` encrypted with AES-256-GCM, a fresh nonce and the namespace and name as additional data, and decrypts it on load; a wrong key or tampered data fails with a clear error. Without a key the authority keeps no `$.server`: a server write there throws and a state holding one is refused. `encryptServerBranch` and `decryptServerBranch` are exported. The authority now needs Node (`node:crypto`) (AMM-1816).
+
 ## 0.5.0
 - **Server logic.** `authority.onChange(pattern, handler)` registers change handlers for wildcard paths that apply, adjust or reject a client change, with the stale flag and the changes since its base; `adjusted` acks carry the value. `authority.write` makes server writes at the next revision, pushed to every client; writes under `$.server` are kept and saved without a revision and never leave the authority. `authority.onEmit` hands client emits to the app server, and `authority.emit` sends one to every client (AMM-1815).
 

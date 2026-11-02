@@ -1,6 +1,6 @@
 {
      "name": "@punyts/state-sync",
-     "version": "0.5.0",
+     "version": "0.6.0",
      "publishConfig": {
           "access": "public"
      },
@@ -37,6 +37,7 @@
           "@punyts/state": "^1.2.0"
      },
      "devDependencies": {
+          "@types/node": "^26.1.1",
           "@vitest/browser-playwright": "^4.1.10",
           "playwright": "^1.61.1",
           "typescript": "^5.9.3",

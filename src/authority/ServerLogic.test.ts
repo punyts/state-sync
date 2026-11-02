@@ -13,6 +13,7 @@ import { createMemoryNamespaceStorage } from "./NamespaceStorage.js";
 vi.mock("@punyts/core", async (original) => ({ ...(await original<typeof import("@punyts/core")>()), report: vi.fn() }));
 
 const NAMESPACE = "apps.expenses";
+const SERVER_KEY = new Uint8Array(32).fill(7);
 
 const STATE = Object.freeze({
     app: Object.freeze({ page: 1 }),
@@ -28,7 +29,7 @@ const change = (path: string, value: unknown, base = 0, op: Change["op"] = "set"
 
 const setup = async (options: Partial<AuthorityOptions> = {}) => {
     const storage = createMemoryNamespaceStorage();
-    const authority = await createAuthority({ namespace: NAMESPACE, storage, initial: copyJson(STATE), ...options });
+    const authority = await createAuthority({ namespace: NAMESPACE, storage, initial: copyJson(STATE), serverKey: SERVER_KEY, ...options });
     const join = (revision?: number) => {
         const received: SyncMessage[] = [];
         const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: vi.fn() });
@@ -268,7 +269,8 @@ describe("server logic", () => {
             expect(revision).toBeUndefined();
             expect(authority.revision()).toBe(0);
             expect(authority.state()).toMatchObject({ server: { apiKey: "secret-key", token: "secret-token" } });
-            expect(await storage.load(NAMESPACE)).toMatchObject({ revision: 0, log: [], state: { server: { token: "secret-token" } } });
+            expect(await storage.load(NAMESPACE)).toMatchObject({ revision: 0, log: [] });
+            expect(await createAuthority({ namespace: NAMESPACE, storage, serverKey: SERVER_KEY }).then((loaded) => loaded.state())).toMatchObject({ server: { token: "secret-token" } });
             expect(client.received).toHaveLength(1);
         });
 
