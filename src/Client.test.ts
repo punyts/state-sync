@@ -64,7 +64,7 @@ describe("createSyncClient", () => {
             await network.settle();
 
             expect(store.get("$")).toEqual(STATE);
-            expect(client.status()).toEqual({ status: "online", waiting: 0 });
+            expect(client.status()).toEqual({ status: "online", waiting: 0, saveFailed: false });
             expect(onStatus.mock.calls.map((call) => call[0].status)).toEqual(["connecting", "online"]);
         });
 
@@ -250,11 +250,11 @@ describe("createSyncClient", () => {
             network.goOnline();
             await network.settle();
 
-            expect(offline).toEqual({ status: "offline", waiting: 2 });
+            expect(offline).toEqual({ status: "offline", waiting: 2, saveFailed: false });
             expect(changeMessages(network.received).map((message) => message.change.path)).toEqual(["$.data.total", "$.app.page"]);
             expect(network.store.get("$")).toMatchObject({ data: { total: 11 }, app: { page: 2 } });
-            expect(client.status()).toEqual({ status: "online", waiting: 0 });
-            expect(onStatus).toHaveBeenCalledWith({ status: "offline", waiting: 2 });
+            expect(client.status()).toEqual({ status: "online", waiting: 0, saveFailed: false });
+            expect(onStatus).toHaveBeenCalledWith({ status: "offline", waiting: 2, saveFailed: false });
         });
 
         it("should fold queued changes to the same path into the last one and keep the order", async () => {
@@ -414,7 +414,7 @@ describe("createSyncClient", () => {
             network.goOffline();
             await network.settle();
 
-            expect(client.status()).toEqual({ status: "offline", waiting: 0 });
+            expect(client.status()).toEqual({ status: "offline", waiting: 0, saveFailed: false });
             expect(backoff).not.toHaveBeenCalled();
             expect(changeMessages(network.received)).toEqual([]);
         });

@@ -96,8 +96,9 @@ never in it.
 const client = createSyncClient({
     namespace: "apps.orders",
     bridge: createStoreBridge(store),
-    transport,                                    // a SyncTransport, such as a WebSocket adapter
-    onStatus: ({ status, waiting }) => { /* connecting, online, offline; changes waiting */ },
+    transport,                                    // a SyncTransport, such as a WebSocket adapter; none for standalone
+    localStore: createWebLocalStore(),            // keeps the state across reloads
+    onStatus: ({ status, waiting, saveFailed }) => { /* standalone, connecting, online, offline; changes waiting */ },
     onRejected: ({ path, reason }) => { /* the value at path is the confirmed one again */ },
     onEmit: (name, value) => { /* a named event from the authority */ }
 });
@@ -121,6 +122,29 @@ client.start();
   catch-up, or are acked again by id when they are resent.
 - `initial: { state, revision, outbox }` is mounted into the store on `start`, before connecting; `client.state()`
   returns the same shape to keep. `client.emit(name, value)` sends an event when online and returns `false` otherwise.
+
+### Local store and Standalone
+
+- **Local store.** With `localStore`, the client mounts what it holds for the namespace on `start` (`initial` when it
+  holds nothing, or the saved state is not a state and revision), before connecting. Saved outbox changes that are not
+  valid changes are skipped.
+- **Saving.** The confirmed state and its revision are saved together as the `confirmed` part, the outbox as the
+  `outbox` part, each when it changes, coalesced to a microtask, confirmed first. A stop between the two leaves a
+  change in both: it is applied again and the authority acks it again by its id. `stop` saves what is pending.
+- **Save failures.** A write that throws (a quota error) is reported, sets `saveFailed` in the status, and the client
+  keeps running in memory. The part is tried again on the next save; a save that succeeds clears `saveFailed`.
+- **Standalone.** A client with no `transport` reports `standalone` and never connects. The local store is the
+  authority: each change is confirmed at once and there is no outbox. An outbox a connected run left is confirmed on
+  `start`. `$.runtime` and `$.server` are never saved.
+- `LocalStore`: `read(namespace, part)`, `write(namespace, part, value)`, `remove(namespace, part)`; the parts are
+  `confirmed`, `outbox` and `document` (the app document, kept by the host). `createWebLocalStore(storage?, prefix?)`
+  keeps each part as JSON under `<prefix>:<namespace>:<part>` in `localStorage` (prefix `punyts.sync`); a value that is
+  not JSON reads as `undefined`. `createMemoryLocalStore()` keeps them in memory.
+
+## Tests
+
+`npm test` runs the unit tests in Node; `npm run test:browser` runs `*.browser.test.ts` in headless Chromium
+(Playwright) against the real `localStorage`: a reload, Standalone across a reload, and a quota error.
 
 ### Bridge and transport
 

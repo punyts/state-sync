@@ -11,15 +11,19 @@ import {
     type WelcomeMessage
 } from "./Messages.js";
 import { SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
+import type { LocalStore } from "./LocalStore.js";
 import type { SyncTransport, TransportConnection } from "./Transport.js";
 import { parseMessage, type SyncLimits } from "./Validate.js";
 
-export type SyncStatus = "connecting" | "online" | "offline";
+/** standalone: no authority, the local store is the authority */
+export type SyncStatus = "standalone" | "connecting" | "online" | "offline";
 
 export interface SyncStatusReport {
     status: SyncStatus;
     /** The changes in the outbox: not yet acknowledged by the authority */
     waiting: number;
+    /** The last write to the local store failed (a quota error); the state is kept in memory */
+    saveFailed: boolean;
 }
 
 export interface SyncRejection {
@@ -37,10 +41,13 @@ export interface SyncClientState {
 export interface SyncClientOptions {
     namespace: string;
     bridge: StoreBridge;
-    transport: SyncTransport;
+    /** The connection to the authority; without one the client is standalone */
+    transport?: SyncTransport;
+    /** Keeps the confirmed state, its revision and the outbox across reloads */
+    localStore?: LocalStore;
     /** crypto.randomUUID by default */
     clientId?: string;
-    /** Mounted into the visible store on start, before any connection */
+    /** Mounted into the visible store on start, before any connection, when the local store holds nothing */
     initial?: SyncClientState;
     limits?: Partial<SyncLimits>;
     /** The wait before reconnect attempt n (0 first); 500 ms doubling to 30 s by default */
@@ -71,6 +78,16 @@ interface OutboxEntry {
 
 const defaultBackoff = (attempt: number) => Math.min(30_000, 500 * 2 ** attempt);
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isConfirmedPart = (value: unknown): value is { state: SyncState; revision: number } =>
+    isRecord(value) &&
+    isRecord(value.state) &&
+    typeof value.revision === "number" &&
+    Number.isInteger(value.revision) &&
+    value.revision >= 0;
+
 /**
  * The client side of state sync. It keeps the confirmed state (the authority's state at its revision) and an ordered
  * outbox of the store's own changes; the visible store is the confirmed state with the outbox on top. Changes from the
@@ -78,13 +95,18 @@ const defaultBackoff = (attempt: number) => Math.min(30_000, 500 * 2 ** attempt)
  * @param options
  */
 export const createSyncClient = (options: SyncClientOptions): SyncClient => {
-    const { namespace, bridge, transport } = options;
+    const { namespace, bridge, transport, localStore } = options;
     const clientId = options.clientId ?? globalThis.crypto.randomUUID();
     const backoff = options.backoff ?? defaultBackoff;
 
     let confirmed: Store<any> = createStore({});
     let revision = 0;
     let outbox: OutboxEntry[] = [];
+
+    //the parts changed since the last write to the local store
+    const dirty = { confirmed: false, outbox: false };
+    let saveScheduled = false;
+    let saveFailed = false;
 
     let running = false;
     let connection: TransportConnection | undefined;
@@ -95,12 +117,14 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     let attempt = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let unsubscribe: (() => void) | undefined;
-    let lastReport: SyncStatusReport = { status: "offline", waiting: 0 };
     let status: SyncStatus = "offline";
+    let lastReport: SyncStatusReport = { status, waiting: 0, saveFailed };
+
+    const currentReport = (): SyncStatusReport => ({ status, waiting: outbox.length, saveFailed });
 
     const reportStatus = () => {
-        const next = { status, waiting: outbox.length };
-        if (next.status !== lastReport.status || next.waiting !== lastReport.waiting) {
+        const next = currentReport();
+        if (next.status !== lastReport.status || next.waiting !== lastReport.waiting || next.saveFailed !== lastReport.saveFailed) {
             lastReport = next;
             options.onStatus?.({ ...next });
         }
@@ -109,6 +133,55 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     const setStatus = (next: SyncStatus) => {
         status = next;
         reportStatus();
+    };
+
+    /**
+     * Writes the changed parts to the local store, confirmed before outbox: a stop between them leaves a confirmed
+     * change also in the outbox, where it is applied again (changes are idempotent) and acked again by its id
+     */
+    const save = () => {
+        saveScheduled = false;
+        if (!localStore) {
+            return;
+        }
+        const parts: [keyof typeof dirty, () => JsonValue][] = [
+            ["confirmed", () => ({ state: copyJson(confirmed.get("$")), revision })],
+            ["outbox", () => outbox.map(({ change }) => copyJson(change))]
+        ];
+        let failed = false;
+        for (const [part, value] of parts) {
+            if (!dirty[part]) {
+                continue;
+            }
+            dirty[part] = false;
+            try {
+                localStore.write(namespace, part, value());
+            }
+            catch (error) {
+                failed = true;
+                report("state-sync", "Could not save the %s of %s: %s", [part, namespace, error instanceof Error ? error.name : String(error)]);
+                //the next save tries the part again
+                dirty[part] = true;
+                break;
+            }
+        }
+        saveFailed = failed;
+        reportStatus();
+    };
+
+    const markDirty = (part: keyof typeof dirty) => {
+        if (!localStore) {
+            return;
+        }
+        dirty[part] = true;
+        if (!saveScheduled) {
+            saveScheduled = true;
+            queueMicrotask(() => {
+                if (saveScheduled) {
+                    save();
+                }
+            });
+        }
     };
 
     /**
@@ -147,7 +220,11 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
 
     const removeFromOutbox = (id: string): OutboxEntry | undefined => {
         const index = outbox.findIndex(({ change }) => change.id === id);
-        return index < 0 ? undefined : outbox.splice(index, 1)[0];
+        if (index < 0) {
+            return undefined;
+        }
+        markDirty("outbox");
+        return outbox.splice(index, 1)[0];
     };
 
     const send = (message: SyncMessage) => connection?.send(JSON.stringify(message));
@@ -219,6 +296,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             }
         }
         revision = message.revision;
+        markDirty("confirmed");
         bridge.load(visibleState());
         welcomed = true;
         attempt = 0;
@@ -243,6 +321,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             }
             applyChange(confirmed, change);
             revision = change.revision;
+            markDirty("confirmed");
             removeFromOutbox(change.id);
             refresh(change.path);
         }
@@ -280,6 +359,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             refresh(path);
         }
         revision = ackRevision;
+        markDirty("confirmed");
         reportStatus();
     };
 
@@ -316,6 +396,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     };
 
     const connect = () => {
+        if (!transport) {
+            return;
+        }
         const token = {};
         current = token;
         //a reconnect stays offline until the connection opens
@@ -349,17 +432,65 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             if (!isSyncPath(local.path) || isAtOrBelow(local.path, SERVER_PATH)) {
                 continue;
             }
+            if (!transport) {
+                //standalone: the local store is the authority, so a change is confirmed at once
+                applyChange(confirmed, local);
+                markDirty("confirmed");
+                continue;
+            }
             const change: Change = { ...local, base: revision };
             //only changes not yet sent fold: every sent change gets its ack. A merge covers nothing below it.
             if (change.op !== "merge") {
                 outbox = outbox.filter((entry) => entry.sent || !isAtOrBelow(entry.change.path, change.path));
             }
             outbox.push({ change, sent: false });
+            markDirty("outbox");
         }
         if (welcomed) {
             sendOutbox();
         }
         reportStatus();
+    };
+
+    /** What the local store holds for the namespace; a part that cannot be read, or a change in it, is skipped */
+    const restore = (): SyncClientState | undefined => {
+        if (!localStore) {
+            return undefined;
+        }
+        const stored = localStore.read(namespace, "confirmed");
+        if (!isConfirmedPart(stored)) {
+            if (stored !== undefined) {
+                report("state-sync", "Ignoring the saved state of %s: it is not a state and revision", [namespace]);
+            }
+            return undefined;
+        }
+        const savedOutbox = localStore.read(namespace, "outbox");
+        const changes: Change[] = [];
+        for (const change of Array.isArray(savedOutbox) ? savedOutbox : []) {
+            const parsed = parseMessage({ type: "change", change }, options.limits);
+            if (parsed.ok && parsed.message.type === "change") {
+                changes.push(parsed.message.change);
+            }
+            else {
+                report("state-sync", "Ignoring a saved change of %s that is not valid", [namespace]);
+            }
+        }
+        return { state: stored.state, revision: stored.revision, outbox: changes };
+    };
+
+    const mount = (mounted: SyncClientState) => {
+        confirmed = createStore(copyJson(mounted.state));
+        revision = mounted.revision;
+        outbox = mounted.outbox.map((change) => ({ change: copyJson<Change>(change), sent: false }));
+        if (!transport && outbox.length > 0) {
+            //a standalone client confirms what a connected run left waiting
+            for (const { change } of outbox) {
+                applyChange(confirmed, change);
+            }
+            outbox = [];
+            markDirty("confirmed");
+            markDirty("outbox");
+        }
     };
 
     return {
@@ -368,13 +499,16 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 return;
             }
             running = true;
-            if (options.initial) {
-                confirmed = createStore(copyJson(options.initial.state));
-                revision = options.initial.revision;
-                outbox = options.initial.outbox.map((change) => ({ change: copyJson<Change>(change), sent: false }));
+            const mounted = restore() ?? options.initial;
+            if (mounted) {
+                mount(mounted);
                 bridge.load(visibleState());
             }
             unsubscribe = bridge.subscribe(enqueue);
+            if (!transport) {
+                setStatus("standalone");
+                return;
+            }
             setStatus("connecting");
             connect();
         },
@@ -387,9 +521,12 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             unsubscribe?.();
             unsubscribe = undefined;
             closeConnection();
-            setStatus("offline");
+            if (saveScheduled) {
+                save();
+            }
+            setStatus(transport ? "offline" : "standalone");
         },
-        status: () => ({ status, waiting: outbox.length }),
+        status: currentReport,
         state: () => ({
             state: copyJson(confirmed.get("$")),
             revision,

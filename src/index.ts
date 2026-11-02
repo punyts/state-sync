@@ -8,3 +8,4 @@ export * from "./Apply.js";
 export * from "./Bridge.js";
 export * from "./Transport.js";
 export * from "./Client.js";
+export * from "./LocalStore.js";

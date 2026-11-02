@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
     test: {
@@ -11,6 +11,7 @@ export default defineConfig({
             'src/**/*.spec.tsx',
             '**/__tests__/**/*.ts',
             '**/__tests__/**/*.tsx'
-        ]
+        ],
+        exclude: [...configDefaults.exclude, 'src/**/*.browser.test.ts']
     }
 });

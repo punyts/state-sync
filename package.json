@@ -1,11 +1,11 @@
 {
      "name": "@punyts/state-sync",
-     "version": "0.2.0",
+     "version": "0.3.0",
      "publishConfig": {
           "access": "public"
      },
      "type": "module",
-     "description": "State sync for @punyts/state: changes, the sync protocol messages and change capture",
+     "description": "State sync for @punyts/state: changes, the sync protocol messages, change capture, the sync client and its local store",
      "main": "dist/index.js",
      "module": "dist/index.js",
      "types": "dist/index.d.ts",
@@ -22,7 +22,8 @@
           "test": "npm run test:run",
           "test:run": "vitest run",
           "test:watch": "vitest --watch",
-          "test:cov": "vitest run --coverage"
+          "test:cov": "vitest run --coverage",
+          "test:browser": "vitest run --config vitest.browser.config.ts"
      },
      "keywords": [],
      "author": "",
@@ -32,7 +33,9 @@
           "@punyts/state": "^1.2.0"
      },
      "devDependencies": {
+          "@vitest/browser-playwright": "^4.1.10",
+          "playwright": "^1.61.1",
           "typescript": "^5.9.3",
-          "vitest": "^3.2.4"
+          "vitest": "^4.1.10"
      }
 }
