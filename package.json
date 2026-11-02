@@ -1,0 +1,38 @@
+{
+     "name": "@punyts/state-sync",
+     "version": "0.1.0",
+     "publishConfig": {
+          "access": "public"
+     },
+     "type": "module",
+     "description": "State sync for @punyts/state: changes, the sync protocol messages and change capture",
+     "main": "dist/index.js",
+     "module": "dist/index.js",
+     "types": "dist/index.d.ts",
+     "exports": {
+          ".": {
+               "types": "./dist/index.d.ts",
+               "default": "./dist/index.js"
+          }
+     },
+     "scripts": {
+          "clean": "bash ../../bin/clean.sh .",
+          "typecheck": "tsc -p tsconfig.build.json --noEmit",
+          "build": "npm run typecheck && bash ../../bin/build.sh . tsc -b tsconfig.build.json",
+          "test": "npm run test:run",
+          "test:run": "vitest run",
+          "test:watch": "vitest --watch",
+          "test:cov": "vitest run --coverage"
+     },
+     "keywords": [],
+     "author": "",
+     "license": "MIT",
+     "dependencies": {
+          "@punyts/core": "^1.0.0",
+          "@punyts/state": "^1.2.0"
+     },
+     "devDependencies": {
+          "typescript": "^5.9.3",
+          "vitest": "^3.2.4"
+     }
+}
