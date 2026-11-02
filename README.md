@@ -141,6 +141,42 @@ client.start();
   keeps each part as JSON under `<prefix>:<namespace>:<part>` in `localStorage` (prefix `punyts.sync`); a value that is
   not JSON reads as `undefined`. `createMemoryLocalStore()` keeps them in memory.
 
+## Authority
+
+`@punyts/state-sync/authority` is the side that owns a namespace's order of changes, for Node (an app server, the
+statenet). It uses no browser or Node-only globals and is a separate entry, so a client bundle never includes it.
+
+```ts
+import { createAuthority, createMemoryNamespaceStorage } from "@punyts/state-sync/authority";
+
+const authority = await createAuthority({ namespace: "apps.orders", storage, initial: { data: {} } });
+wss.on("connection", (socket) => {
+    const session = authority.connect({ send: (text) => socket.send(text), close: () => socket.close() });
+    socket.on("message", (data) => session.receive(String(data)));
+    socket.on("close", session.close);
+});
+```
+
+- **State.** The authority holds the namespace's store, its revision, a log of the last `logLength` changes (1000 by
+  default) and the last `appliedLength` applied change ids (10000 by default, never fewer than the log). `initial` is
+  the state at revision 0 when the storage holds nothing.
+- **hello.** Answered with `welcome`: the logged changes after the client's revision, or a snapshot (no `$.runtime` or
+  `$.server`) when the client has nothing (revision 0), is ahead of the authority, is behind the log, or is more than
+  `maxChanges` behind. A hello for another namespace is an `error` (`wrong-namespace`) and the connection is closed.
+  Another hello on the same connection, the client's catch-up after a gap, is answered the same way.
+- **change.** A change before `welcome` is an `error` (`no-hello`). A change id applied before is acked `applied` with
+  its revision and not applied again. A change at or below `$.server`, or under a parent that does not exist (any op
+  but `delete`), is acked `rejected`. Otherwise the change is applied with `applyChange` at the next revision, in
+  arrival order (stale or not), logged, acked `applied`, and pushed as `changes` to every other welcomed connection.
+- **Messages** are handled one at a time in arrival order; every message is checked with `parseMessage`, and a refused
+  one is answered with its `error`.
+- **Storage.** `NamespaceStorage` is the port: `load(namespace)` and `save(namespace, { state, revision, log, applied
+  })`, both async. After each change a save is scheduled, coalesced to a microtask, one save at a time; a failed save is
+  reported and the next change saves again. `flush()` waits for the pending saves. `createMemoryNamespaceStorage()` is
+  the adapter for tests.
+- `authority.revision()`, `authority.state()` (a copy, `$.server` included) and `authority.close()` (closes every
+  connection).
+
 ## Tests
 
 `npm test` runs the unit tests in Node; `npm run test:browser` runs `*.browser.test.ts` in headless Chromium

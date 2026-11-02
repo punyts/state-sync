@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.0
+- **Authority.** `@punyts/state-sync/authority`: `createAuthority` owns a namespace's order of changes. It answers `hello` with the logged changes or a snapshot, applies each change at the next revision in arrival order, acks it, pushes it to the other connections, applies a repeated change id once, rejects changes under `$.server` or a missing parent, and saves the state, revision, log and applied ids through the `NamespaceStorage` port (`createMemoryNamespaceStorage` for tests). Connections come in through `authority.connect({ send, close })` (AMM-1814).
+
 ## 0.3.0
 - **Local store and Standalone mode.** The `LocalStore` port with `createWebLocalStore` (over `localStorage`) and `createMemoryLocalStore`. With `localStore` the sync client mounts the saved confirmed state, revision and outbox on start and saves them as they change, coalesced to a microtask; a failed save (a quota error) is reported and sets `saveFailed` in the status while the client keeps running in memory. A client with no `transport` is `standalone`: changes are confirmed at once and kept in the local store. Chromium tests (`npm run test:browser`); the library moves to Vitest 4 (AMM-1813).
 
