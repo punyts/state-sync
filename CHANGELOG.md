@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.7.0
+- **Sparse states.** `applyChange` creates missing parents as empty objects for a set, replace or merge (a merge with nothing to merge into sets), and a delete below a missing parent does nothing. `createAuthority({ createParents: true })` accepts client changes and server writes below a missing parent instead of rejecting them, for states that hold only what a user changed, such as the articulation of `$.app` (AMM-1819).
+
 ## 0.6.0
 - **`$.server` encryption at rest.** `createAuthority({ serverKey })` saves each direct child of `$.server` encrypted with AES-256-GCM, a fresh nonce and the namespace and name as additional data, and decrypts it on load; a wrong key or tampered data fails with a clear error. Without a key the authority keeps no `$.server`: a server write there throws and a state holding one is refused. `encryptServerBranch` and `decryptServerBranch` are exported. The authority now needs Node (`node:crypto`) (AMM-1816).
 

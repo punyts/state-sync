@@ -43,6 +43,13 @@ export interface AuthorityOptions {
      * initial state with one is refused
      */
     serverKey?: Uint8Array;
+    /**
+     * Accepts client changes and server writes below a parent that does not exist and creates the missing parents as
+     * empty objects; such a change is rejected (a write throws) by default. For sparse states, such as the articulation of
+     * $.app only where a user changed it
+     */
+    createParents?: boolean;
+
 }
 
 /** What a change handler gets */
@@ -89,7 +96,7 @@ export interface Authority {
     /**
      * A server write: applied at once and pushed to every client with the next revision, which it returns. A write at or
      * below $.server is applied and saved only: it takes no revision and never reaches a client. Throws for a path that
-     * is not a sync path or whose parent does not exist.
+     * is not a sync path or whose parent does not exist (unless createParents).
      */
     write: (write: ServerWrite) => number | undefined;
     /** Sends a named event to every welcomed client */
@@ -141,6 +148,7 @@ const serverBranch = (value: JsonValue | undefined, namespace: string): { [name:
 export const createAuthority = async (options: AuthorityOptions): Promise<Authority> => {
     const { namespace, storage } = options;
     const logLength = Math.max(0, options.logLength ?? 1000);
+    const createParents = options.createParents === true;
     const appliedLength = Math.max(logLength, options.appliedLength ?? 10_000);
     const limits: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...options.limits };
 
@@ -251,7 +259,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     /** Why the change cannot be applied to the store, or undefined when it can */
     const missingParent = (change: Pick<Change, "path" | "op">): string | undefined => {
         const parent = parentOf(change.path);
-        return change.op !== "delete" && parent !== "$" && !isComposite(store.get(parent))
+        return change.op !== "delete" && !createParents && parent !== "$" && !isComposite(store.get(parent))
             ? `${parent} does not exist`
             : undefined;
     };

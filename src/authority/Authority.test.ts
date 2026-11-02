@@ -225,6 +225,19 @@ describe("createAuthority", () => {
             expect(reader.received).toHaveLength(1);
         });
 
+        it("should create missing parents with createParents", async () => {
+            const { authority, join } = await setup({ createParents: true });
+            const writer = join(0);
+            const reader = join(0);
+
+            writer.session.receive(change("$.data.missing.total", 1, "set", "m"));
+            authority.write({ path: "$.app.children.dialog.open", op: "set", value: true });
+
+            expect(writer.received.at(-2)).toEqual({ type: "ack", id: "m", result: "applied", revision: 1 });
+            expect(authority.state()).toMatchObject({ app: { children: { dialog: { open: true } } }, data: { missing: { total: 1 } } });
+            expect(reader.received.filter((message) => message.type === "changes")).toHaveLength(2);
+        });
+
         it("should allow a new top-level branch and a delete of a path that does not exist", async () => {
             const { authority, join } = await setup();
             const writer = join(0);

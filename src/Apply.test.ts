@@ -61,6 +61,24 @@ describe("applyChange", () => {
         expect(store.get("$.data.order.tags")).toEqual(["b"]);
     });
 
+    it("should create missing parents for a deep set and merge", () => {
+        const store = setup();
+
+        applyChange(store, { path: "$.app.children.dialog.open", op: "set", value: true });
+        applyChange(store, { path: "$.data.order.qty.extra", op: "merge", value: { a: 1 } });
+
+        expect(store.get("$.app")).toEqual({ children: { dialog: { open: true } } });
+        expect(store.get("$.data.order.qty")).toEqual({ extra: { a: 1 } });
+    });
+
+    it("should do nothing for a delete below a missing parent", () => {
+        const store = setup();
+
+        applyChange(store, { path: "$.app.children.dialog", op: "delete" });
+
+        expect(store.get("$.app")).toBeUndefined();
+    });
+
     it("should pass the origin to the listeners", () => {
         const store = setup();
         const listener = vi.fn();

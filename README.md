@@ -87,8 +87,9 @@ never in it.
 ## Applying a change
 
 `applyChange(store, change, options?)` applies a change with the store's own methods: `set` with `set`, `replace` with
-`replace` (or `set` when the path or the value is not an object or array), `merge` with `apply` and `delete` with
-`delete`. The value is copied first. The client, and the authority later, apply every change this way.
+`replace` (or `set` when the path or the value is not an object or array), `merge` with `apply` (or `set` when there
+is nothing to merge into) and `delete` with `delete`. The value is copied first. A set, replace or merge below a
+missing parent creates the missing parents as empty objects; a delete below a missing parent does nothing. The client, and the authority later, apply every change this way.
 
 ## Sync client
 
@@ -159,14 +160,15 @@ wss.on("connection", (socket) => {
 
 - **State.** The authority holds the namespace's store, its revision, a log of the last `logLength` changes (1000 by
   default) and the last `appliedLength` applied change ids (10000 by default, never fewer than the log). `initial` is
-  the state at revision 0 when the storage holds nothing.
+  the state at revision 0 when the storage holds nothing. `createParents: true` suits a sparse state (only what a user
+  changed, such as the articulation of `$.app`): changes and writes below a missing parent create it.
 - **hello.** Answered with `welcome`: the logged changes after the client's revision, or a snapshot (no `$.runtime` or
   `$.server`) when the client has nothing (revision 0), is ahead of the authority, is behind the log, or is more than
   `maxChanges` behind. A hello for another namespace is an `error` (`wrong-namespace`) and the connection is closed.
   Another hello on the same connection, the client's catch-up after a gap, is answered the same way.
 - **change.** A change before `welcome` is an `error` (`no-hello`). A change id applied before is acked `applied` with
   its revision and not applied again. A change at or below `$.server`, or under a parent that does not exist (any op
-  but `delete`), is acked `rejected`. Otherwise the change is applied with `applyChange` at the next revision, in
+  but `delete`, unless the authority was made with `createParents: true`), is acked `rejected`. Otherwise the change is applied with `applyChange` at the next revision, in
   arrival order (stale or not), logged, acked `applied`, and pushed as `changes` to every other welcomed connection.
 - **Messages** are handled one at a time in arrival order; every message is checked with `parseMessage`, and a refused
   one is answered with its `error`.
@@ -202,7 +204,7 @@ authority.emit("notice", { text: "saved" });
   that removes the handler.
 - **Server writes** (`write`) go to any sync path at any time and are not passed to handlers; they may be made from a
   handler. A write outside `$.server` gets the next revision, is logged and pushed to every client, and `write` returns
-  the revision. A path that is not a sync path or whose parent does not exist throws.
+  the revision. A path that is not a sync path, or whose parent does not exist without `createParents`, throws.
 - **`$.server`** never leaves the authority: a client change at or below it is rejected before any handler runs, and a
   server write under it is applied and saved but takes no revision, so it is never logged, pushed or in a `welcome`,
   and clients see no revision gap. Snapshots leave it out.
