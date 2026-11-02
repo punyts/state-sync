@@ -1,6 +1,7 @@
 import { report } from "@punyts/core";
 import type { EventListenerFn, Store } from "@punyts/state";
 import type { Change, ChangeOp, JsonValue } from "./Change.js";
+import { copyJson } from "./Apply.js";
 import { RUNTIME_PATH, SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
 
 export interface CaptureOptions {
@@ -28,8 +29,6 @@ interface Pending {
 }
 
 const ALL_PATH = "$.$all";
-
-const copyJson = (value: unknown): JsonValue => JSON.parse(JSON.stringify(value));
 
 const parentPath = (path: string) => path.slice(0, path.lastIndexOf("."));
 

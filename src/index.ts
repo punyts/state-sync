@@ -4,3 +4,7 @@ export * from "./Paths.js";
 export * from "./Validate.js";
 export * from "./Capture.js";
 export * from "./Snapshot.js";
+export * from "./Apply.js";
+export * from "./Bridge.js";
+export * from "./Transport.js";
+export * from "./Client.js";

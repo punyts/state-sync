@@ -83,3 +83,50 @@ capture.stop();                                   // stop listening, drop what i
 
 `syncSnapshot(store)` is the state as JSON without `$.runtime` and `$.server`. Aliases are links, not state, so they are
 never in it.
+
+## Applying a change
+
+`applyChange(store, change, options?)` applies a change with the store's own methods: `set` with `set`, `replace` with
+`replace` (or `set` when the path or the value is not an object or array), `merge` with `apply` and `delete` with
+`delete`. The value is copied first. The client, and the authority later, apply every change this way.
+
+## Sync client
+
+```ts
+const client = createSyncClient({
+    namespace: "apps.orders",
+    bridge: createStoreBridge(store),
+    transport,                                    // a SyncTransport, such as a WebSocket adapter
+    onStatus: ({ status, waiting }) => { /* connecting, online, offline; changes waiting */ },
+    onRejected: ({ path, reason }) => { /* the value at path is the confirmed one again */ },
+    onEmit: (name, value) => { /* a named event from the authority */ }
+});
+client.start();
+```
+
+- **Confirmed state and outbox.** The client keeps the authority's state at its revision and an ordered outbox of the
+  store's own changes. The store shows the confirmed state with the outbox on top, so a change shows at once, online or
+  offline. Changes from the authority are written through the bridge with the `sync` origin and are never sent back.
+- **Folding.** A new change replaces the waiting changes at its path and drops those below it, unless it is a merge.
+  The order of the rest is kept. A change already sent is never folded, so each sent change gets its ack.
+- **Connecting.** When the connection opens the client sends `hello` with its namespace, revision and client id. On
+  `welcome` it takes the snapshot or applies the changes after its revision (a change of its own in them leaves the
+  outbox), loads the visible state into the store, and sends the outbox in order.
+- **Acks.** `applied` puts the change into the confirmed state; `adjusted` puts the ack value at the path and shows it;
+  `rejected` shows the confirmed value at the path again and calls `onRejected`. The change leaves the outbox.
+- **Catch-up.** A skipped revision in `changes` sends `hello` again; changes and acks wait for the new `welcome`.
+- **Reconnect.** A dropped connection reports `offline` and reconnects after `backoff(attempt)`, 500 ms doubling to
+  30 s by default. The status stays `offline` until a connection opens, is `connecting` until `welcome`, and the
+  attempt count starts over after `welcome`. Changes the authority had applied before the drop come back by id in the
+  catch-up, or are acked again by id when they are resent.
+- `initial: { state, revision, outbox }` is mounted into the store on `start`, before connecting; `client.state()`
+  returns the same shape to keep. `client.emit(name, value)` sends an event when online and returns `false` otherwise.
+
+### Bridge and transport
+
+- `StoreBridge`: `load(state)` sets every top-level branch and removes the others (`runtime` and `server` stay),
+  `write(path, value)` writes one path (`undefined` deletes), `subscribe(onChanges)` gives the store's own changes.
+  `createStoreBridge(store)` is the bridge to a store in the same page; a host page reaches a framed runtime with a
+  bridge over messages.
+- `SyncTransport.connect({ onOpen, onMessage, onClose })` returns `{ send, close }`. Messages are text; the client checks
+  every message with `parseMessage` and ignores the ones it refuses. Handlers are called after `connect` returns.
