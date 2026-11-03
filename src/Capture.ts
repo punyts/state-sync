@@ -11,6 +11,11 @@ export interface CaptureOptions {
     onChanges: (changes: Change[]) => void;
     /** Makes change ids; globalThis.crypto.randomUUID by default */
     createId?: () => string;
+    /**
+     * The write origins captured besides untagged writes, such as the origin of local logic; writes with any other
+     * origin (a change applied from the authority) give no change
+     */
+    origins?: readonly string[];
 }
 
 export interface Capture {
@@ -64,6 +69,7 @@ const fold = (pending: Pending[]): Pending[] => {
  */
 export const captureChanges = (store: Store<any>, options: CaptureOptions): Capture => {
     const createId = options.createId ?? (() => globalThis.crypto.randomUUID());
+    const origins = options.origins ?? [];
     let pending: Pending[] = [];
     let scheduled = false;
     let stopped = false;
@@ -109,7 +115,7 @@ export const captureChanges = (store: Store<any>, options: CaptureOptions): Capt
     };
 
     const listener: EventListenerFn = (path, value, _oldValue, action, origin) => {
-        if (origin !== undefined || action.endsWith("-child") || action === "relink") {
+        if ((origin !== undefined && !origins.includes(origin)) || action.endsWith("-child") || action === "relink") {
             return;
         }
         if (path === "$" || isAtOrBelow(path, RUNTIME_PATH) || isAtOrBelow(path, SERVER_PATH)) {

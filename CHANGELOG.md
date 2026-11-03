@@ -1,6 +1,7 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
+- **Server logic after a change, batched writes and reads.** `authority.onApplied(handler)` runs server logic after a client change is committed and acknowledged, with the change as applied and the client id. `authority.writeAll(writes)` applies server writes in order and pushes those outside `$.server` in one `changes` message, checking every path first. `authority.get(path)` returns a copy of one value. `captureChanges` takes `origins`, write origins captured besides untagged writes (the writes of local logic).
 - Docs: the README describes the three modes (Standalone, Persisted, Full) and has security notes (AMM-1822).
 
 ## 0.7.0

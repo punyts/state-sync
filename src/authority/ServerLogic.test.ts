@@ -256,6 +256,92 @@ describe("server logic", () => {
             expect(() => authority.write({ path: "$.data.missing.x", op: "set", value: 1 })).toThrow("$.data.missing does not exist");
             expect(authority.revision()).toBe(0);
         });
+
+        it("should push the writes of writeAll to every client in one changes message", async () => {
+            const { authority, join } = await setup();
+            const client = join(0);
+
+            const revisions = authority.writeAll([
+                { path: "$.data.expenses.e1", op: "set", value: { amount: 3 } },
+                { path: "$.server.token", op: "set", value: "t" },
+                { path: "$.data.total", op: "set", value: 3 }
+            ]);
+
+            expect(revisions).toEqual([1, undefined, 2]);
+            const pushes = client.received.filter((message) => message.type === "changes");
+            expect(pushes).toHaveLength(1);
+            expect(pushes[0]).toMatchObject({ changes: [{ path: "$.data.expenses.e1", revision: 1 }, { path: "$.data.total", revision: 2 }] });
+        });
+
+        it("should write nothing from writeAll when one path is not a sync path", async () => {
+            const { authority, join } = await setup();
+            const client = join(0);
+
+            expect(() => authority.writeAll([
+                { path: "$.data.total", op: "set", value: 5 },
+                { path: "$.runtime.x", op: "set", value: 1 }
+            ])).toThrow("$.runtime.x is not a sync path");
+
+            expect(authority.revision()).toBe(0);
+            expect(client.received.filter((message) => message.type === "changes")).toEqual([]);
+        });
+
+        it("should read a copy of one path with get", async () => {
+            const { authority } = await setup();
+
+            const expenses = authority.get("$.data.expenses") as Record<string, unknown>;
+            expenses["e9"] = { amount: 1 };
+
+            expect(authority.get("$.data.total")).toBe(0);
+            expect(authority.get("$.server.apiKey")).toBe("secret-key");
+            expect(authority.get("$.data.missing")).toBeUndefined();
+            expect(authority.get("$.data.expenses")).toEqual({});
+        });
+    });
+
+    describe("after-apply handlers", () => {
+        it("should call onApplied after the ack with the change as applied and the client id", async () => {
+            const { authority, join } = await setup();
+            authority.onChange("$.data.total", () => ({ result: "adjust", value: 9 }));
+            const writer = join(0);
+            const seen: unknown[] = [];
+            authority.onApplied((applied, clientId) => {
+                seen.push({ applied, clientId, acked: writer.received.some((message) => message.type === "ack") });
+            });
+
+            writer.session.receive(change("$.data.total", 5));
+
+            expect(seen).toEqual([{ applied: expect.objectContaining({ path: "$.data.total", value: 9, revision: 1 }), clientId: "tab-1", acked: true }]);
+        });
+
+        it("should not call onApplied for a rejected change and stop once removed", async () => {
+            const { authority, join } = await setup();
+            const handler = vi.fn();
+            const remove = authority.onApplied(handler);
+            const writer = join(0);
+
+            writer.session.receive(change("$.server.apiKey", "x"));
+            remove();
+            writer.session.receive(change("$.data.total", 1));
+
+            expect(handler).not.toHaveBeenCalled();
+        });
+
+        it("should let an after-apply handler write and report one that throws", async () => {
+            const { authority, join } = await setup();
+            authority.onApplied(() => {
+                throw new Error("boom");
+            });
+            authority.onApplied((applied) => {
+                if (applied.path === "$.data.total") authority.write({ path: "$.app.page", op: "set", value: 2 });
+            });
+            const writer = join(0);
+
+            writer.session.receive(change("$.data.total", 1));
+
+            expect(authority.state()).toMatchObject({ app: { page: 2 }, data: { total: 1 } });
+            expect(report).toHaveBeenCalledWith("state-sync", expect.stringContaining("after a change"), [NAMESPACE, "boom"]);
+        });
     });
 
     describe("$.server", () => {

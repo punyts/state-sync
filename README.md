@@ -86,7 +86,8 @@ capture.stop();                                   // stop listening, drop what i
   `delete`. `apply` gives a `set` per key. Capture never gives `merge`.
 - A write inside an array (an element set, a push, a splice, `store.delete` of an element) gives a `set` of the whole
   array, read when the batch is sent, since splices move every later index.
-- No change comes from a write with an origin (apply the authority's changes with `{ origin }`), from `*-child` and
+- No change comes from a write with an origin (apply the authority's changes with `{ origin }`) unless the origin is in
+  `origins` (the writes of local logic, which must sync like the user's own), from `*-child` and
   `relink` events, from alias paths (a write through an alias gives the target path), or from `$.runtime` and
   `$.server`.
 - The value is copied as JSON when it is written.
@@ -191,8 +192,8 @@ wss.on("connection", (socket) => {
   })`, both async. After each change a save is scheduled, coalesced to a microtask, one save at a time; a failed save is
   reported and the next change saves again. `flush()` waits for the pending saves. `createMemoryNamespaceStorage()` is
   the adapter for tests.
-- `authority.revision()`, `authority.state()` (a copy, `$.server` included) and `authority.close()` (closes every
-  connection).
+- `authority.revision()`, `authority.state()` (a copy, `$.server` included), `authority.get(path)` (a copy of one value)
+  and `authority.close()` (closes every connection).
 
 ### Server logic
 
@@ -220,6 +221,11 @@ authority.emit("notice", { text: "saved" });
 - **Server writes** (`write`) go to any sync path at any time and are not passed to handlers; they may be made from a
   handler. A write outside `$.server` gets the next revision, is logged and pushed to every client, and `write` returns
   the revision. A path that is not a sync path, or whose parent does not exist without `createParents`, throws.
+  `writeAll(writes)` applies several in order and pushes those outside `$.server` in one `changes` message, so a client
+  never sees half of them; every path is checked before anything is written.
+- **After-apply handlers** (`onApplied(handler)`) run after a client change is committed and acknowledged, with the change
+  as applied and the client id, for logic that reacts to a change rather than deciding it; they may make server writes. A
+  handler that throws is reported and the others still run.
 - **`$.server`** never leaves the authority: a client change at or below it is rejected before any handler runs, and a
   server write under it is applied and saved but takes no revision, so it is never logged, pushed or in a `welcome`,
   and clients see no revision gap. Snapshots leave it out.

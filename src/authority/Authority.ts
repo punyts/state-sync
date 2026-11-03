@@ -76,6 +76,9 @@ export type ChangeVerdict =
 /** Server logic for client changes; synchronous, so changes stay in arrival order */
 export type ChangeHandler = (context: ChangeContext) => ChangeVerdict;
 
+/** Server logic that runs after a client change was committed and acknowledged */
+export type AppliedHandler = (change: RevisedChange, clientId: string) => void;
+
 /** Server logic for a client's emit */
 export type EmitHandler = (name: string, value: JsonValue | undefined, clientId: string) => void;
 
@@ -91,6 +94,11 @@ export interface Authority {
      * segment); returns the function that removes it
      */
     onChange: (pattern: string, handler: ChangeHandler) => () => void;
+    /**
+     * Registers server logic that runs after a client change was committed and acknowledged, with the change as
+     * applied; it may make server writes. Returns the function that removes it
+     */
+    onApplied: (handler: AppliedHandler) => () => void;
     /** Registers server logic for client emits; returns the function that removes it */
     onEmit: (handler: EmitHandler) => () => void;
     /**
@@ -99,6 +107,14 @@ export interface Authority {
      * is not a sync path or whose parent does not exist (unless createParents).
      */
     write: (write: ServerWrite) => number | undefined;
+    /**
+     * Server writes applied in order, as one push: the writes outside $.server reach every client in a single changes
+     * message. Every path is checked first, so a write that is not a sync path, or one at or below $.server without a
+     * serverKey, throws before anything is written. Returns the revision of each write (undefined under $.server)
+     */
+    writeAll: (writes: readonly ServerWrite[]) => (number | undefined)[];
+    /** A copy of the value at a path of the current state, $.server included; undefined when there is none */
+    get: (path: string) => JsonValue | undefined;
     /** Sends a named event to every welcomed client */
     emit: (name: string, value?: JsonValue) => void;
     revision: () => number;
@@ -175,6 +191,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const sessions = new Set<Session>();
     const handlers: RegisteredHandler[] = [];
     const emitHandlers = new Set<EmitHandler>();
+    const appliedHandlers = new Set<AppliedHandler>();
 
     let dirty = false;
     let saving: Promise<void> = Promise.resolve();
@@ -265,7 +282,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     };
 
     /** Applies an accepted change at the next revision, logs it and pushes it to every welcomed session but the writer */
-    const commit = (change: Change, writer?: Session): number => {
+    /** Applies and logs a change; pushes it to the other clients unless `batch` collects it for one push */
+    const commit = (change: Change, writer?: Session, batch?: RevisedChange[]): RevisedChange => {
         applyChange(store, change);
         revision++;
         const revised: RevisedChange = { ...copyJson<Change>(change), revision };
@@ -274,12 +292,55 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             log.splice(0, log.length - logLength);
         }
         scheduleSave();
+        if (batch !== undefined) {
+            batch.push(revised);
+        } else {
+            push([revised], writer);
+        }
+        return revised;
+    };
+
+    const push = (changes: RevisedChange[], writer?: Session) => {
+        if (changes.length === 0) {
+            return;
+        }
         for (const other of sessions) {
             if (other !== writer && other.welcomed) {
-                send(other, { type: "changes", changes: [revised] });
+                send(other, { type: "changes", changes });
             }
         }
-        return revision;
+    };
+
+    /** Checks a server write before anything is written; throws with the reason */
+    const checkWrite = (write: ServerWrite) => {
+        if (!isSyncPath(write.path)) {
+            throw new Error(`${write.path} is not a sync path`);
+        }
+        if (isAtOrBelow(write.path, SERVER_PATH) && serverKey === undefined) {
+            throw new Error(`${SERVER_PATH} needs a serverKey, so it is never stored in plaintext`);
+        }
+    };
+
+    /** One server write; a write outside $.server is committed into `batch` or pushed at once */
+    const serverWrite = (write: ServerWrite, batch?: RevisedChange[]): number | undefined => {
+        checkWrite(write);
+        const missing = missingParent(write);
+        if (missing !== undefined) {
+            throw new Error(missing);
+        }
+        if (isAtOrBelow(write.path, SERVER_PATH)) {
+            if (write.path === SERVER_PATH && write.op !== "delete") {
+                serverBranch(write.value, namespace);
+            }
+            //server-only: no revision, so clients never see a gap
+            applyChange(store, write);
+            scheduleSave();
+            return undefined;
+        }
+        const change: Change = write.value === undefined
+            ? { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, base: revision }
+            : { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, value: copyJson(write.value), base: revision };
+        return commit(change, undefined, batch).revision;
     };
 
     /** Runs the handlers that touch the change in registration order: the change as adjusted, or the first rejection */
@@ -340,7 +401,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             ack(session, { id: received.id, result: "rejected", reason: missing });
             return;
         }
-        const at = commit(change, session);
+        const revised = commit(change, session);
+        const at = revised.revision;
         applied.set(change.id, at);
         if (applied.size > appliedLength) {
             applied.delete(applied.keys().next().value!);
@@ -348,6 +410,13 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         ack(session, adjusted
             ? { id: change.id, result: "adjusted", revision: at, value: copyJson(change.value) }
             : { id: change.id, result: "applied", revision: at });
+        for (const handler of [...appliedHandlers]) {
+            try {
+                handler(copyJson(revised), session.clientId);
+            } catch (error) {
+                report("state-sync", "Server logic after a change of %s failed: %s", [namespace, error instanceof Error ? error.message : String(error)]);
+            }
+        }
     };
 
     const onEmit = (session: Session, name: string, value: JsonValue | undefined) => {
@@ -425,31 +494,25 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 emitHandlers.delete(handler);
             };
         },
-        write: (write) => {
-            if (!isSyncPath(write.path)) {
-                throw new Error(`${write.path} is not a sync path`);
+        onApplied: (handler) => {
+            appliedHandlers.add(handler);
+            return () => {
+                appliedHandlers.delete(handler);
+            };
+        },
+        write: (write) => serverWrite(write),
+        writeAll: (writes) => {
+            writes.forEach(checkWrite);
+            const batch: RevisedChange[] = [];
+            try {
+                return writes.map((write) => serverWrite(write, batch));
+            } finally {
+                push(batch);
             }
-            const server = isAtOrBelow(write.path, SERVER_PATH);
-            if (server && serverKey === undefined) {
-                throw new Error(`${SERVER_PATH} needs a serverKey, so it is never stored in plaintext`);
-            }
-            const missing = missingParent(write);
-            if (missing !== undefined) {
-                throw new Error(missing);
-            }
-            if (server) {
-                if (write.path === SERVER_PATH && write.op !== "delete") {
-                    serverBranch(write.value, namespace);
-                }
-                //server-only: no revision, so clients never see a gap
-                applyChange(store, write);
-                scheduleSave();
-                return undefined;
-            }
-            const change: Change = write.value === undefined
-                ? { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, base: revision }
-                : { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, value: copyJson(write.value), base: revision };
-            return commit(change);
+        },
+        get: (path) => {
+            const value: unknown = path === "$" ? store.get("$") : store.get(path);
+            return value === undefined ? undefined : copyJson<JsonValue>(value as JsonValue);
         },
         emit: (name, value) => {
             for (const session of sessions) {
