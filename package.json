@@ -20,9 +20,9 @@
           }
      },
      "scripts": {
-          "clean": "bash ../../bin/clean.sh .",
+          "clean": "node -e \"const fs=require('fs');for(const f of ['dist','.build-stamp',...fs.readdirSync('.').filter((n)=>n.endsWith('.tsbuildinfo'))])fs.rmSync(f,{recursive:true,force:true})\"",
           "typecheck": "tsc -p tsconfig.build.json --noEmit",
-          "build": "npm run typecheck && bash ../../bin/build.sh . tsc -b tsconfig.build.json",
+          "build": "npm run typecheck && tsc -b tsconfig.build.json",
           "test": "npm run test:run",
           "test:run": "vitest run",
           "test:watch": "vitest --watch",
