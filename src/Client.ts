@@ -3,6 +3,7 @@ import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "./Apply.js";
 import type { LocalChange, StoreBridge, SyncState } from "./Bridge.js";
 import type { Change, JsonValue } from "./Change.js";
+import { randomId } from "./RandomId.js";
 import {
     PROTOCOL_VERSION,
     REVOKED_CODE,
@@ -51,7 +52,7 @@ export interface SyncClientOptions {
     transport?: SyncTransport;
     /** Keeps the confirmed state, its revision and the outbox across reloads */
     localStore?: LocalStore;
-    /** crypto.randomUUID by default */
+    /** randomId by default */
     clientId?: string;
     /** Mounted into the visible store on start, before any connection, when the local store holds nothing */
     initial?: SyncClientState;
@@ -113,7 +114,7 @@ const isConfirmedPart = (value: unknown): value is { state: SyncState; revision:
  */
 export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     const { namespace, bridge, transport, localStore } = options;
-    const clientId = options.clientId ?? globalThis.crypto.randomUUID();
+    const clientId = options.clientId ?? randomId();
     const backoff = options.backoff ?? defaultBackoff;
 
     let confirmed: Store<any> = createStore({});

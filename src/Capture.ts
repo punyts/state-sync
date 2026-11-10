@@ -3,13 +3,14 @@ import type { EventListenerFn, Store } from "@punyts/state";
 import type { Change, ChangeOp, JsonValue } from "./Change.js";
 import { copyJson } from "./Apply.js";
 import { RUNTIME_PATH, SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
+import { randomId } from "./RandomId.js";
 
 export interface CaptureOptions {
     /** The authority revision the store is at, read when a batch is sent */
     base: () => number;
     /** Gets each batch of changes, in the order they were made */
     onChanges: (changes: Change[]) => void;
-    /** Makes change ids; globalThis.crypto.randomUUID by default */
+    /** Makes change ids; randomId by default */
     createId?: () => string;
     /**
      * The write origins captured besides untagged writes, such as the origin of local logic; writes with any other
@@ -68,7 +69,7 @@ const fold = (pending: Pending[]): Pending[] => {
  * @param options
  */
 export const captureChanges = (store: Store<any>, options: CaptureOptions): Capture => {
-    const createId = options.createId ?? (() => globalThis.crypto.randomUUID());
+    const createId = options.createId ?? randomId;
     const origins = options.origins ?? [];
     let pending: Pending[] = [];
     let scheduled = false;
