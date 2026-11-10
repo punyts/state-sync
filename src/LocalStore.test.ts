@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createMemoryLocalStore, createWebLocalStore, type KeyValueStorage } from "./LocalStore.js";
+import { createMemoryLocalStore, createWebLocalStore, forgetNamespace, LOCAL_PARTS, type KeyValueStorage } from "./LocalStore.js";
 
 const createStorage = () => {
     const values = new Map<string, string>();
@@ -84,5 +84,18 @@ describe("createMemoryLocalStore", () => {
 
         expect(local.read("a", "document")).toEqual({ list: [1] });
         expect(local.read("b", "document")).toEqual({ list: [2] });
+    });
+});
+
+describe("forgetNamespace", () => {
+    it("should remove every part of the namespace and nothing else", () => {
+        const local = createMemoryLocalStore();
+        for (const part of LOCAL_PARTS) local.write("apps.orders", part, 1);
+        local.write("apps.other", "confirmed", 2);
+
+        forgetNamespace(local, "apps.orders");
+
+        for (const part of LOCAL_PARTS) expect(local.read("apps.orders", part)).toBeUndefined();
+        expect(local.read("apps.other", "confirmed")).toBe(2);
     });
 });

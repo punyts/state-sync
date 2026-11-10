@@ -8,6 +8,9 @@ import type { JsonValue } from "./Change.js";
  */
 export type LocalPart = "confirmed" | "outbox" | "document";
 
+/** Every part a namespace is kept in */
+export const LOCAL_PARTS: readonly LocalPart[] = ["confirmed", "outbox", "document"];
+
 /** The port the sync client keeps its state in across reloads */
 export interface LocalStore {
     /** The part's value, undefined when nothing is kept or it cannot be read */
@@ -16,6 +19,13 @@ export interface LocalStore {
     write: (namespace: string, part: LocalPart, value: JsonValue) => void;
     remove: (namespace: string, part: LocalPart) => void;
 }
+
+/** Deletes every part of the namespace, so nothing of it is kept */
+export const forgetNamespace = (store: LocalStore, namespace: string): void => {
+    for (const part of LOCAL_PARTS) {
+        store.remove(namespace, part);
+    }
+};
 
 /** The calls of the Web Storage API the adapter uses (localStorage) */
 export interface KeyValueStorage {

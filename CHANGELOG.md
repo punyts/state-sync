@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- **Revoked access.** The error code `revoked` (`REVOKED_CODE`) tells a client it may no longer have the namespace. The sync client then stops for good (no reconnect, no save, `start` does nothing), deletes every part of the namespace from its local store (the confirmed state, the outbox and the host's document) and calls `onRevoked(message)`. A client that was offline is told on its next `hello`. `forgetNamespace(store, namespace)` and `LOCAL_PARTS` are exported. For Magnetic's revocable share links.
+
 ## 0.8.0
 - **Server logic after a change, batched writes and reads.** `authority.onApplied(handler)` runs server logic after a client change is committed and acknowledged, with the change as applied and the client id. `authority.writeAll(writes)` applies server writes in order and pushes those outside `$.server` in one `changes` message, checking every path first. `authority.get(path)` returns a copy of one value. `captureChanges` takes `origins`, write origins captured besides untagged writes (the writes of local logic).
 - Docs: the README describes the three modes (Standalone, Persisted, Full) and has security notes (AMM-1822).

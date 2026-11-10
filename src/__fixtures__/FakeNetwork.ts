@@ -37,6 +37,8 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
     const received: SyncMessage[] = [];
     let online = true;
     let lose: ((message: SyncMessage) => boolean) | undefined;
+    //set by revoke(): every hello is answered with the error `revoked`
+    let revokedWith: string | undefined;
 
     const toClient = (connection: FakeConnection, message: SyncMessage) => {
         queue.push(() => {
@@ -64,6 +66,10 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
     const handle = (connection: FakeConnection, message: SyncMessage) => {
         received.push(message);
         if (message.type === "hello") {
+            if (revokedWith !== undefined) {
+                toClient(connection, { type: "error", code: "revoked", message: revokedWith });
+                return;
+            }
             const oldest = revision - log.length;
             toClient(connection, options.snapshots || message.revision < oldest
                 ? { type: "welcome", namespace, revision, snapshot: copyJson(store.get("$")) }
@@ -172,6 +178,13 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
         /** The next message to a client that matches is lost */
         loseNext: (match: (message: SyncMessage) => boolean) => {
             lose = match;
+        },
+        /** Revokes the namespace: the connected clients get the error `revoked`, and so does every later hello */
+        revoke: (message: string) => {
+            revokedWith = message;
+            for (const connection of connections) {
+                toClient(connection, { type: "error", code: "revoked", message });
+            }
         },
         /** Sends an emit to every connected client */
         emit: (name: string, value?: JsonValue) => {

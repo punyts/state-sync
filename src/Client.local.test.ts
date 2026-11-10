@@ -236,3 +236,54 @@ describe("createSyncClient with a local store", () => {
         });
     });
 });
+
+describe("createSyncClient when the namespace is revoked", () => {
+    it("should delete every part of the namespace, stop, and say why", async () => {
+        const network = createFakeNetwork(NAMESPACE, { state: copyJson(STATE) });
+        const localStore = createMemoryLocalStore();
+        localStore.write(NAMESPACE, "document", { screens: {} });
+        localStore.write("apps.other", "confirmed", { state: {}, revision: 1 });
+        const onRevoked = vi.fn();
+        const { store, client } = open({ transport: network.transport, localStore, onRevoked });
+        await network.settle();
+        network.goOffline();
+        await network.settle();
+        store.set("$.data.total", 12);
+        await tick();
+        expect(localStore.read(NAMESPACE, "outbox")).toHaveLength(1);
+
+        network.revoke("This app is no longer shared with you");
+        network.goOnline();
+        await network.settle();
+        store.set("$.data.total", 13);
+        await network.settle();
+        client.stop();
+        client.start();
+        await network.settle();
+
+        expect(onRevoked).toHaveBeenCalledTimes(1);
+        expect(onRevoked).toHaveBeenCalledWith("This app is no longer shared with you");
+        for (const part of ["confirmed", "outbox", "document"] as const) expect(localStore.read(NAMESPACE, part)).toBeUndefined();
+        expect(localStore.read("apps.other", "confirmed")).toEqual({ state: {}, revision: 1 });
+        expect(client.state().outbox).toEqual([]);
+        expect(client.status().status).toBe("offline");
+        expect(network.received.filter((message) => message.type === "hello")).toHaveLength(2);
+        expect(network.received.filter((message) => message.type === "change")).toHaveLength(0);
+    });
+
+    it("should be revoked while online, before a pending save is written", async () => {
+        const network = createFakeNetwork(NAMESPACE, { state: copyJson(STATE) });
+        const localStore = createMemoryLocalStore();
+        const onRevoked = vi.fn();
+        const { client } = open({ transport: network.transport, localStore, onRevoked });
+        await network.settle();
+        expect(client.status().status).toBe("online");
+
+        network.revoke("Revoked");
+        await network.settle();
+
+        expect(onRevoked).toHaveBeenCalledWith("Revoked");
+        expect(localStore.read(NAMESPACE, "confirmed")).toBeUndefined();
+        expect(network.received.filter((message) => message.type === "hello")).toHaveLength(1);
+    });
+});

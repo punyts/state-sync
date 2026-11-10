@@ -5,13 +5,14 @@ import type { LocalChange, StoreBridge, SyncState } from "./Bridge.js";
 import type { Change, JsonValue } from "./Change.js";
 import {
     PROTOCOL_VERSION,
+    REVOKED_CODE,
     type AckMessage,
     type ChangesMessage,
     type SyncMessage,
     type WelcomeMessage
 } from "./Messages.js";
 import { SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
-import type { LocalStore } from "./LocalStore.js";
+import { forgetNamespace, type LocalStore } from "./LocalStore.js";
 import type { SyncTransport, TransportConnection } from "./Transport.js";
 import { parseMessage, type SyncLimits } from "./Validate.js";
 
@@ -56,6 +57,13 @@ export interface SyncClientOptions {
     /** The authority refused a change; its path shows the confirmed value again */
     onRejected?: (rejection: SyncRejection) => void;
     onEmit?: (name: string, value?: JsonValue) => void;
+    /**
+     * The authority sent the error `revoked`: this client may no longer have the namespace. Before this is called the
+     * client has stopped for good (no reconnect, no save, `start` does nothing) and deleted every part of the namespace
+     * from the local store, the host's document included. The visible store still shows the last state, for the host
+     * to clear
+     */
+    onRevoked?: (message: string) => void;
 }
 
 export interface SyncClient {
@@ -109,6 +117,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     let saveFailed = false;
 
     let running = false;
+    //the namespace was revoked: the client never runs again
+    let revoked = false;
     let connection: TransportConnection | undefined;
     //the handlers of a connection act only while it is the current one
     let current: object | undefined;
@@ -388,11 +398,40 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 options.onEmit?.(message.name, message.value);
                 return;
             case "error":
+                if (message.code === REVOKED_CODE) {
+                    revoke(message.message);
+                    return;
+                }
                 report("state-sync", "The authority sent an error: %s %s", [message.code, message.message]);
                 return;
             default:
                 report("state-sync", "Ignoring a %s message from the authority", [message.type]);
         }
+    };
+
+    /** Stops for good and deletes what the local store keeps of the namespace, the outbox included */
+    const revoke = (text: string) => {
+        if (revoked) {
+            return;
+        }
+        revoked = true;
+        running = false;
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            timer = undefined;
+        }
+        unsubscribe?.();
+        unsubscribe = undefined;
+        closeConnection();
+        saveScheduled = false;
+        dirty.confirmed = false;
+        dirty.outbox = false;
+        outbox = [];
+        if (localStore) {
+            forgetNamespace(localStore, namespace);
+        }
+        setStatus("offline");
+        options.onRevoked?.(text);
     };
 
     const connect = () => {
@@ -495,7 +534,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
 
     return {
         start: () => {
-            if (running) {
+            if (running || revoked) {
                 return;
             }
             running = true;
@@ -521,7 +560,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             unsubscribe?.();
             unsubscribe = undefined;
             closeConnection();
-            if (saveScheduled) {
+            if (saveScheduled && !revoked) {
                 save();
             }
             setStatus(transport ? "offline" : "standalone");

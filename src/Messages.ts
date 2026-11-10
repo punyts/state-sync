@@ -78,5 +78,12 @@ export type SyncMessage =
 
 export type SyncMessageType = SyncMessage["type"];
 
+/**
+ * The error code of an authority, or of the server in front of it, that no longer lets this client have the namespace
+ * (its access was revoked): the client deletes what it keeps of the namespace and stops for good
+ * (`SyncClientOptions.onRevoked`)
+ */
+export const REVOKED_CODE = "revoked";
+
 /** The error codes parseMessage gives */
 export type SyncErrorCode = "invalid-json" | "too-large" | "invalid-message";
