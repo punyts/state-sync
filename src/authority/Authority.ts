@@ -8,6 +8,7 @@ import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
 import { isWithinPattern, touchesPattern } from "./Patterns.js";
+import { checkAccess, type Access, type GrantContext } from "./Grants.js";
 import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
@@ -54,6 +55,12 @@ export interface AuthorityOptions {
      * is applied and pushed like any other, marked ephemeral, but never saved, and never holds up the durable watermark
      */
     ephemeral?: readonly string[];
+    /**
+     * Checks every client change against its connection's access (`connect`) at the owner node: the owner of `address`
+     * writes freely, anyone else needs a write grant that covers the path, checked at each change, so a revoked grant
+     * stops working at once. Without it the caller decides who connects
+     */
+    access?: { address: string; context: () => GrantContext };
 }
 
 /** What a change handler gets */
@@ -92,7 +99,7 @@ export type ServerWrite = Pick<Change, "path" | "op" | "value">;
 export interface Authority {
     readonly namespace: string;
     /** Takes a client connection; the caller passes its messages and its close to the session */
-    connect: (connection: AuthorityConnection) => AuthoritySession;
+    connect: (connection: AuthorityConnection, access?: Access) => AuthoritySession;
     /**
      * Registers server logic for client changes at, below or above the paths a pattern matches ("*" matches one
      * segment); returns the function that removes it
@@ -150,6 +157,8 @@ interface Session {
     clientId: string;
     /** The protocol of its hello: 2 gets the durable watermark */
     protocol: number;
+    /** Who the connection is and the grant it presents, for `AuthorityOptions.access` */
+    access?: Access;
 }
 
 interface RegisteredHandler {
@@ -473,6 +482,13 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
             return;
         }
+        if (options.access !== undefined) {
+            const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, options.access.context());
+            if (!allowed.ok) {
+                ack(session, { id: received.id, result: "rejected", reason: allowed.reason });
+                return;
+            }
+        }
         const outcome = runHandlers(session, received);
         if ("reason" in outcome) {
             ack(session, { id: received.id, result: "rejected", reason: outcome.reason });
@@ -552,8 +568,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
 
     return {
         namespace,
-        connect: (connection) => {
-            const session: Session = { connection, welcomed: false, clientId: "", protocol: 1 };
+        connect: (connection, access) => {
+            const session: Session = { connection, welcomed: false, clientId: "", protocol: 1, ...(access === undefined ? {} : { access }) };
             sessions.add(session);
             return {
                 receive: (text) => receive(session, text),
