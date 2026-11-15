@@ -8,8 +8,8 @@ import { checkAccess, RevocationList, type Access, type GrantKey } from "./Grant
  * changes under its prefix since the revision it had, `previous`
  */
 export type RelayWelcome =
-    | { readonly revision: number; readonly value: JsonValue | undefined; readonly durable?: number }
-    | { readonly revision: number; readonly previous: number; readonly changes: readonly RevisedChange[]; readonly durable?: number };
+    | { readonly revision: number; readonly value: JsonValue | undefined; readonly durable?: number; readonly epoch?: number }
+    | { readonly revision: number; readonly previous: number; readonly changes: readonly RevisedChange[]; readonly durable?: number; readonly epoch?: number };
 
 /**
  * Changes under a listener's prefix, already projected onto it (a change above the prefix comes as the part it writes
@@ -19,6 +19,8 @@ export interface RelayBatch {
     readonly previous: number;
     readonly revision: number;
     readonly changes: readonly RevisedChange[];
+    /** The epoch of the owner that ordered them: a relay refuses an older one than it has seen */
+    readonly epoch?: number;
 }
 
 /** What a subscription delivers, in order: one welcome, then batches and watermarks, until it is closed */
@@ -121,7 +123,7 @@ const applyTo = (root: { [key: string]: JsonValue }, change: RevisedChange): voi
  * changes under its prefix. A subscription with a revision the authority's log still reaches gets the changes since;
  * any other a snapshot of the prefix
  */
-export const createAuthorityUpstream = (resolve: (address: string) => Promise<Authority | undefined>): Upstream => ({
+export const createAuthorityUpstream = (resolve: (address: string) => Promise<Authority | undefined>, epochOf?: (address: string) => number | undefined): Upstream => ({
     subscribe: (address, prefix, revision, listener) => {
         let closed = false;
         const removers: (() => void)[] = [];
@@ -135,7 +137,8 @@ export const createAuthorityUpstream = (resolve: (address: string) => Promise<Au
             }
             let last = authority.revision();
             const since = revision === undefined ? undefined : authority.changesSince(revision);
-            const durable = { durable: authority.durable() };
+            const epoch = epochOf?.(address);
+            const durable = { durable: authority.durable(), ...(epoch === undefined ? {} : { epoch }) };
             listener.welcome(since === undefined
                 ? { revision: last, value: authority.get(prefix), ...durable }
                 : { revision: last, previous: revision as number, changes: since.map((change) => projectChange(change, prefix)).filter((change) => change !== undefined), ...durable });
@@ -146,7 +149,7 @@ export const createAuthorityUpstream = (resolve: (address: string) => Promise<Au
                     //nothing under the prefix: the listener's revision stays where it is
                     return;
                 }
-                listener.changes({ previous: last, revision: to, changes: projected });
+                listener.changes({ previous: last, revision: to, changes: projected, ...(epoch === undefined ? {} : { epoch }) });
                 last = to;
             }));
             removers.push(authority.onDurable((to) => listener.durable?.(to)));
@@ -205,6 +208,8 @@ interface Entry {
     durable: number;
     /** The cached tree: only the prefix's subtree, at its real path */
     readonly root: { [key: string]: JsonValue };
+    /** The newest owner epoch seen: changes from an older one are refused */
+    epoch: number;
     /** The projected changes since `logFrom`, oldest first */
     log: RevisedChange[];
     logFrom: number;
@@ -295,9 +300,16 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
         listening.revision = entry.revision;
     };
 
-    const open = (entry: Entry) => {
-        entry.upstream = upstream.subscribe(entry.address, entry.prefix, entry.ready ? entry.revision : undefined, {
+    /** Subscribes upstream from the cache's revision, or for a snapshot when it has none or must start over (`fresh`) */
+    const open = (entry: Entry, fresh = false) => {
+        entry.upstream = upstream.subscribe(entry.address, entry.prefix, entry.ready && !fresh ? entry.revision : undefined, {
             welcome: (welcome) => {
+                if (welcome.epoch !== undefined) {
+                    if (welcome.epoch < entry.epoch) {
+                        return;
+                    }
+                    entry.epoch = welcome.epoch;
+                }
                 if ("value" in welcome) {
                     //a snapshot: the cache starts over at its revision
                     for (const key of Object.keys(entry.root)) {
@@ -350,6 +362,17 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
 
     /** Takes changes from upstream into the cache and passes them on; a gap subscribes again from the cache's revision */
     const accept = (entry: Entry, batch: RelayBatch, catchingUp: boolean) => {
+        if (batch.epoch !== undefined && batch.epoch !== entry.epoch) {
+            if (batch.epoch < entry.epoch) {
+                //an owner that lost ownership: what it ordered is refused
+                return;
+            }
+            //a new owner started from the durable revision: what the old one ordered past it is gone, so start over
+            entry.epoch = batch.epoch;
+            entry.upstream?.close();
+            open(entry, true);
+            return;
+        }
         if (batch.previous !== entry.revision && !(catchingUp && batch.previous <= entry.revision)) {
             entry.upstream?.close();
             open(entry);
@@ -436,7 +459,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             let entry = entries.get(key);
             const listening: Listening = { listener, revision, expires: now() + leaseMs, chain: allowed.chain, readEnds: allowed.expires, ...(access === undefined ? {} : { access }) };
             if (entry === undefined) {
-                entry = { address, prefix, upstream: undefined, ready: false, revision: 0, durable: 0, root: {}, log: [], logFrom: 0, listeners: new Set() };
+                entry = { address, prefix, upstream: undefined, ready: false, revision: 0, durable: 0, epoch: 0, root: {}, log: [], logFrom: 0, listeners: new Set() };
                 entries.set(key, entry);
                 entry.listeners.add({ ...listening, waiting: revision });
                 const added = [...entry.listeners][0] as Listening;
