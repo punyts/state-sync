@@ -106,6 +106,13 @@ export interface Authority {
     /** Registers server logic for client emits; returns the function that removes it */
     onEmit: (handler: EmitHandler) => () => void;
     /**
+     * Registers a listener for every change the authority commits, a client's or a server write, in the batches it
+     * pushes them in (a relay that serves the namespace onward); returns the function that removes it
+     */
+    onChanges: (listener: (changes: readonly RevisedChange[]) => void) => () => void;
+    /** The changes after a revision, from the log; undefined when the log no longer reaches back to it */
+    changesSince: (revision: number) => RevisedChange[] | undefined;
+    /**
      * A server write: applied at once and pushed to every client with the next revision, which it returns. A write at or
      * below $.server is applied and saved only: it takes no revision and never reaches a client. Throws for a path that
      * is not a sync path or whose parent does not exist (unless createParents).
@@ -204,6 +211,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const handlers: RegisteredHandler[] = [];
     const emitHandlers = new Set<EmitHandler>();
     const appliedHandlers = new Set<AppliedHandler>();
+    const changeListeners = new Set<(changes: readonly RevisedChange[]) => void>();
 
     let dirty = false;
     let saving: Promise<void> = Promise.resolve();
@@ -376,6 +384,9 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const push = (changes: RevisedChange[], writer?: Session) => {
         if (changes.length === 0) {
             return;
+        }
+        for (const listener of changeListeners) {
+            listener(copyJson<RevisedChange[]>(changes));
         }
         for (const other of sessions) {
             if (other !== writer && other.welcomed) {
@@ -566,6 +577,23 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return () => {
                 emitHandlers.delete(handler);
             };
+        },
+        onChanges: (listener) => {
+            changeListeners.add(listener);
+            return () => {
+                changeListeners.delete(listener);
+            };
+        },
+        changesSince: (since) => {
+            if (since === revision) {
+                return [];
+            }
+            //the log is complete back to the revision before its first change
+            const first = log[0];
+            if (since > revision || first === undefined || since < first.revision - 1) {
+                return undefined;
+            }
+            return copyJson<RevisedChange[]>(log.filter((logged) => logged.revision > since));
         },
         onApplied: (handler) => {
             appliedHandlers.add(handler);
