@@ -192,8 +192,8 @@ describe("createSyncClient with a local store", () => {
         it("should report standalone and not connect", () => {
             const { client, onStatus } = open({ localStore: createMemoryLocalStore() });
 
-            expect(client.status()).toEqual({ status: "standalone", waiting: 0, saveFailed: false });
-            expect(onStatus).toHaveBeenCalledWith({ status: "standalone", waiting: 0, saveFailed: false });
+            expect(client.status()).toEqual({ status: "standalone", waiting: 0, pending: 0, saveFailed: false });
+            expect(onStatus).toHaveBeenCalledWith({ status: "standalone", waiting: 0, pending: 0, saveFailed: false });
             expect(client.emit("ping")).toBe(false);
         });
 

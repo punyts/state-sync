@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Protocol 2: the durable watermark and ephemeral paths.** A client sends `protocol: 2`; an authority speaks 1 and 2. After each save lands the authority sends protocol 2 clients `durable { revision }` (and puts `durable` in `welcome`): every change up to it is stored. `Authority` has `durable()`, `whenDurable(revision?)` and `onDurable`. `AuthorityOptions.ephemeral` lists paths (`*` for one segment) whose changes are applied and pushed marked `ephemeral: true` (to protocol 2 clients) but never saved, never logged in storage and never hold up the watermark. The client reports `pending` (its changes applied but not durable yet, counted only once the authority sends a watermark), has `durable()`, and calls `onDurable(revision, committedIds)`. Tests: `Authority.test.ts` (durability, a client of an authority with a watermark).
 - **Revoked access.** The error code `revoked` (`REVOKED_CODE`) tells a client it may no longer have the namespace. The sync client then stops for good (no reconnect, no save, `start` does nothing), deletes every part of the namespace from its local store (the confirmed state, the outbox and the host's document) and calls `onRevoked(message)`. A client that was offline is told on its next `hello`. `forgetNamespace(store, namespace)` and `LOCAL_PARTS` are exported. For Magnetic's revocable share links.
 
 ## 0.8.0

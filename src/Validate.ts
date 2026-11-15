@@ -1,5 +1,5 @@
 import { CHANGE_OPS, type ChangeOp } from "./Change.js";
-import { PROTOCOL_VERSION, type ErrorMessage, type SyncErrorCode, type SyncMessage } from "./Messages.js";
+import { PROTOCOL_VERSIONS, type ErrorMessage, type SyncErrorCode, type SyncMessage } from "./Messages.js";
 import { isSyncPath } from "./Paths.js";
 
 /** The bounds parseMessage holds a message to */
@@ -140,7 +140,10 @@ const checkChange = (value: unknown, where: string, limits: SyncLimits, revised:
         return fail(`${where} must be an object`);
     }
     const required = revised ? ["id", "path", "op", "base", "revision"] : ["id", "path", "op", "base"];
-    checkKeys(value, where, required, ["value"]);
+    checkKeys(value, where, required, revised ? ["value", "ephemeral"] : ["value"]);
+    if (revised && "ephemeral" in value && value.ephemeral !== true) {
+        fail(`${where}.ephemeral must be true`);
+    }
     checkString(value.id, `${where}.id`, limits.maxIdLength);
     const path = checkString(value.path, `${where}.path`, limits.maxPathLength);
     if (!isSyncPath(path)) {
@@ -193,14 +196,17 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
             checkNamespace(message.namespace, limits);
             checkRevision(message.revision, "revision");
             checkString(message.clientId, "clientId", limits.maxIdLength);
-            if (message.protocol !== PROTOCOL_VERSION) {
-                fail(`protocol must be ${PROTOCOL_VERSION}`);
+            if (!PROTOCOL_VERSIONS.includes(message.protocol as number)) {
+                fail(`protocol must be one of ${PROTOCOL_VERSIONS.join(", ")}`);
             }
             return;
         case "welcome":
-            checkKeys(message, "welcome", ["type", "namespace", "revision"], ["changes", "snapshot"]);
+            checkKeys(message, "welcome", ["type", "namespace", "revision"], ["changes", "snapshot", "durable"]);
             checkNamespace(message.namespace, limits);
             checkRevision(message.revision, "revision");
+            if ("durable" in message) {
+                checkRevision(message.durable, "durable");
+            }
             if (("changes" in message) === ("snapshot" in message)) {
                 fail("welcome must have exactly one of changes and snapshot");
             }
@@ -217,6 +223,10 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
         case "changes":
             checkKeys(message, "changes", ["type", "changes"]);
             checkChanges(message.changes, "changes", limits);
+            return;
+        case "durable":
+            checkKeys(message, "durable", ["type", "revision"]);
+            checkRevision(message.revision, "revision");
             return;
         case "change":
             checkKeys(message, "change", ["type", "change"]);

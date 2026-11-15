@@ -7,7 +7,7 @@ import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
-import { touchesPattern } from "./Patterns.js";
+import { isWithinPattern, touchesPattern } from "./Patterns.js";
 import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
@@ -49,7 +49,11 @@ export interface AuthorityOptions {
      * $.app only where a user changed it
      */
     createParents?: boolean;
-
+    /**
+     * Ephemeral paths ("$."-prefixed, "*" matching one segment), such as a pointer or presence: a change at or below one
+     * is applied and pushed like any other, marked ephemeral, but never saved, and never holds up the durable watermark
+     */
+    ephemeral?: readonly string[];
 }
 
 /** What a change handler gets */
@@ -118,6 +122,12 @@ export interface Authority {
     /** Sends a named event to every welcomed client */
     emit: (name: string, value?: JsonValue) => void;
     revision: () => number;
+    /** How far the namespace is durable: every change up to this revision is saved, or ephemeral */
+    durable: () => number;
+    /** Resolves once the namespace is durable up to a revision, the current one by default */
+    whenDurable: (revision?: number) => Promise<void>;
+    /** Registers a listener for each advance of the durable watermark; returns the function that removes it */
+    onDurable: (listener: (revision: number) => void) => () => void;
     /** A copy of the whole state, $.server included */
     state: () => { [key: string]: JsonValue };
     /** Resolves when every pending save is done */
@@ -131,6 +141,8 @@ interface Session {
     /** Answered with welcome; only welcomed sessions get changes */
     welcomed: boolean;
     clientId: string;
+    /** The protocol of its hello: 2 gets the durable watermark */
+    protocol: number;
 }
 
 interface RegisteredHandler {
@@ -196,6 +208,56 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     let dirty = false;
     let saving: Promise<void> = Promise.resolve();
     let saveScheduled = false;
+    const ephemeral = options.ephemeral ?? [];
+    const isEphemeral = (path: string) => ephemeral.some((pattern) => isWithinPattern(pattern, path));
+    //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
+    let durableRevision = revision;
+    const durableListeners = new Set<(revision: number) => void>();
+    const durableWaiters: { revision: number; resolve: () => void }[] = [];
+
+    /** Moves the watermark forward, tells the protocol 2 sessions and resolves the waits it passes */
+    const markDurable = (to: number) => {
+        if (to <= durableRevision) {
+            return;
+        }
+        durableRevision = to;
+        for (const session of sessions) {
+            if (session.welcomed && session.protocol >= 2) {
+                send(session, { type: "durable", revision: to });
+            }
+        }
+        for (const listener of durableListeners) {
+            listener(to);
+        }
+        for (let index = durableWaiters.length - 1; index >= 0; index--) {
+            const waiter = durableWaiters[index] as (typeof durableWaiters)[number];
+            if (waiter.revision <= to) {
+                durableWaiters.splice(index, 1);
+                waiter.resolve();
+            }
+        }
+    };
+
+    /** Removes the values at the paths an ephemeral pattern matches from a copy of the state */
+    const stripEphemeral = (state: { [key: string]: JsonValue }) => {
+        const strip = (node: JsonValue | undefined, segments: readonly string[]): void => {
+            if (node === null || typeof node !== "object" || Array.isArray(node) || segments.length === 0) {
+                return;
+            }
+            const [first, ...rest] = segments as [string, ...string[]];
+            for (const key of first === "*" ? Object.keys(node) : [first]) {
+                if (rest.length === 0) {
+                    delete node[key];
+                }
+                else {
+                    strip(node[key], rest);
+                }
+            }
+        };
+        for (const pattern of ephemeral) {
+            strip(state, pattern.split(".").slice(1));
+        }
+    };
 
     const storedNamespace = (): StoredNamespace => {
         const state = copyJson<{ [key: string]: JsonValue }>(store.get("$"));
@@ -203,10 +265,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             //$.server is only ever saved encrypted
             state[SERVER_KEY] = encryptServerBranch(serverBranch(state[SERVER_KEY], namespace), serverKey, namespace);
         }
+        stripEphemeral(state);
         return {
             state,
             revision,
-            log: copyJson<RevisedChange[]>(log),
+            log: copyJson<RevisedChange[]>(log.filter((logged) => logged.ephemeral !== true)),
             applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision }))
         };
     };
@@ -216,8 +279,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         dirty = false;
+        const stored = storedNamespace();
         try {
-            await storage.save(namespace, storedNamespace());
+            await storage.save(namespace, stored);
+            //nothing durable changed since this save took its copy: everything after it is ephemeral
+            markDurable(dirty ? stored.revision : revision);
         }
         catch (error) {
             //tried again with the next change
@@ -264,11 +330,14 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const missing = revision - hello.revision;
         //a client at 0 has nothing; one ahead of the authority has a state the authority does not know
         const logged = hello.revision > 0 && missing >= 0 && missing <= log.length && missing <= limits.maxChanges;
+        const durable = hello.protocol >= 2 ? { durable: durableRevision } : {};
+        const changes = log.slice(log.length - missing);
         send(session, logged
-            ? { type: "welcome", namespace, revision, changes: log.slice(log.length - missing) }
-            : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store) });
+            ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable }
+            : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable });
         session.welcomed = true;
         session.clientId = hello.clientId;
+        session.protocol = hello.protocol;
     };
 
     const ack = (session: Session, message: Omit<AckMessage, "type">) => send(session, { type: "ack", ...message });
@@ -286,12 +355,16 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const commit = (change: Change, writer?: Session, batch?: RevisedChange[]): RevisedChange => {
         applyChange(store, change);
         revision++;
-        const revised: RevisedChange = { ...copyJson<Change>(change), revision };
+        const passing = isEphemeral(change.path);
+        const revised: RevisedChange = passing ? { ...copyJson<Change>(change), revision, ephemeral: true } : { ...copyJson<Change>(change), revision };
         log.push(revised);
         if (log.length > logLength) {
             log.splice(0, log.length - logLength);
         }
-        scheduleSave();
+        //an ephemeral change is never saved, so it writes nothing and never holds up the watermark
+        if (!passing) {
+            scheduleSave();
+        }
         if (batch !== undefined) {
             batch.push(revised);
         } else {
@@ -306,7 +379,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         for (const other of sessions) {
             if (other !== writer && other.welcomed) {
-                send(other, { type: "changes", changes });
+                send(other, { type: "changes", changes: other.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change) });
             }
         }
     };
@@ -469,7 +542,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     return {
         namespace,
         connect: (connection) => {
-            const session: Session = { connection, welcomed: false, clientId: "" };
+            const session: Session = { connection, welcomed: false, clientId: "", protocol: 1 };
             sessions.add(session);
             return {
                 receive: (text) => receive(session, text),
@@ -522,6 +595,20 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             }
         },
         revision: () => revision,
+        durable: () => durableRevision,
+        whenDurable: (at = revision) => {
+            //a revision no durable change reached is durable already: only ephemeral changes came after the watermark
+            if (at <= durableRevision || (!dirty && !saveScheduled && log.filter((logged) => logged.revision > durableRevision && logged.revision <= at).every((logged) => logged.ephemeral === true))) {
+                return Promise.resolve();
+            }
+            return new Promise<void>((resolve) => durableWaiters.push({ revision: at, resolve }));
+        },
+        onDurable: (listener) => {
+            durableListeners.add(listener);
+            return () => {
+                durableListeners.delete(listener);
+            };
+        },
         state: () => copyJson(store.get("$")),
         flush: async () => {
             if (saveScheduled) {

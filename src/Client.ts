@@ -23,6 +23,11 @@ export interface SyncStatusReport {
     status: SyncStatus;
     /** The changes in the outbox: not yet acknowledged by the authority */
     waiting: number;
+    /**
+     * This client's changes the authority applied that are not durable yet (protocol 2): shown, but pending until the
+     * watermark passes them, when they are committed
+     */
+    pending: number;
     /** The last write to the local store failed (a quota error); the state is kept in memory */
     saveFailed: boolean;
 }
@@ -57,6 +62,8 @@ export interface SyncClientOptions {
     /** The authority refused a change; its path shows the confirmed value again */
     onRejected?: (rejection: SyncRejection) => void;
     onEmit?: (name: string, value?: JsonValue) => void;
+    /** The durable watermark moved (protocol 2): every change up to `revision` is committed, with the ids of this client's changes it committed */
+    onDurable?: (revision: number, committed: readonly string[]) => void;
     /**
      * The authority sent the error `revoked`: this client may no longer have the namespace. Before this is called the
      * client has stopped for good (no reconnect, no save, `start` does nothing) and deleted every part of the namespace
@@ -76,6 +83,8 @@ export interface SyncClient {
     state: () => SyncClientState;
     /** Sends a named event to the authority; false when not online */
     emit: (name: string, value?: JsonValue) => boolean;
+    /** How far the namespace is durable, as the authority last said (protocol 2); 0 before it says */
+    durable: () => number;
 }
 
 interface OutboxEntry {
@@ -128,13 +137,35 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let unsubscribe: (() => void) | undefined;
     let status: SyncStatus = "offline";
-    let lastReport: SyncStatusReport = { status, waiting: 0, saveFailed };
+    let lastReport: SyncStatusReport = { status, waiting: 0, pending: 0, saveFailed };
+    let durable = 0;
+    //the authority sends a watermark (its welcome had one): until then nothing is counted pending
+    let watermarked = false;
+    //this client's changes the authority applied, by id, with their revision, until the watermark passes them
+    const uncommitted = new Map<string, number>();
 
-    const currentReport = (): SyncStatusReport => ({ status, waiting: outbox.length, saveFailed });
+    const currentReport = (): SyncStatusReport => ({ status, waiting: outbox.length, pending: uncommitted.size, saveFailed });
+
+    /** Takes the authority's watermark: the changes up to it are committed */
+    const onDurableRevision = (to: number) => {
+        if (to < durable) {
+            return;
+        }
+        durable = to;
+        const committed: string[] = [];
+        for (const [id, at] of uncommitted) {
+            if (at <= to) {
+                uncommitted.delete(id);
+                committed.push(id);
+            }
+        }
+        reportStatus();
+        options.onDurable?.(to, committed);
+    };
 
     const reportStatus = () => {
         const next = currentReport();
-        if (next.status !== lastReport.status || next.waiting !== lastReport.waiting || next.saveFailed !== lastReport.saveFailed) {
+        if (next.status !== lastReport.status || next.waiting !== lastReport.waiting || next.pending !== lastReport.pending || next.saveFailed !== lastReport.saveFailed) {
             lastReport = next;
             options.onStatus?.({ ...next });
         }
@@ -312,6 +343,13 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         attempt = 0;
         setStatus("online");
         sendOutbox();
+        watermarked = message.durable !== undefined;
+        if (!watermarked) {
+            uncommitted.clear();
+        }
+        if (message.durable !== undefined) {
+            onDurableRevision(message.durable);
+        }
     };
 
     /** A revision was skipped: ask for a catch-up again */
@@ -351,6 +389,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             return;
         }
         const ackRevision = message.revision ?? 0;
+        if (watermarked && ackRevision > durable) {
+            uncommitted.set(message.id, ackRevision);
+        }
         if (ackRevision <= revision) {
             //already in the confirmed state through a catch-up
             reportStatus();
@@ -392,6 +433,11 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             case "ack":
                 if (welcomed) {
                     onAck(message);
+                }
+                return;
+            case "durable":
+                if (welcomed) {
+                    onDurableRevision(message.revision);
                 }
                 return;
             case "emit":
@@ -577,6 +623,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             }
             send(value === undefined ? { type: "emit", name } : { type: "emit", name, value });
             return true;
-        }
+        },
+        durable: () => durable
     };
 };

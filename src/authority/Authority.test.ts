@@ -132,7 +132,7 @@ describe("createAuthority", () => {
             const { join } = await setup();
             const old = join();
 
-            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 2 }));
+            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 3 }));
             old.session.receive(change("$.data.total", 1));
 
             expect(old.received.map((message) => message.type === "error" && message.code)).toEqual(["invalid-message", "no-hello"]);
@@ -474,5 +474,132 @@ describe("createAuthority", () => {
             expect(one.store.get("$")).toEqual({ app: { page: 9 }, data: { total: 6, items: [] } });
             expect(back.state().revision).toBe(authority.revision());
         });
+    });
+});
+
+describe("createAuthority: durability", () => {
+    /** Storage whose saves wait until released, counting them */
+    const slowStorage = () => {
+        const inner = createMemoryNamespaceStorage();
+        const waiting: (() => void)[] = [];
+        let saves = 0;
+        const storage: NamespaceStorage = {
+            load: inner.load,
+            save: async (namespace, stored) => {
+                saves++;
+                await new Promise<void>((resolve) => waiting.push(resolve));
+                await inner.save(namespace, stored);
+            }
+        };
+        return { storage, release: async () => {
+            for (const resolve of waiting.splice(0)) resolve();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }, saves: () => saves };
+    };
+    const hello2 = (revision = 0) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision, clientId: "c2", protocol: 2 });
+
+    it("should tell a protocol 2 client how far the namespace is durable, in its welcome and as each save lands", async () => {
+        // Arrange
+        const slow = slowStorage();
+        const { authority, join } = await setup({ storage: slow.storage });
+        const watcher = join();
+        watcher.session.receive(hello2());
+        const old = join(0);
+
+        // Act
+        join(0).session.receive(change("$.data.total", 11, "set", "a"));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const before = authority.durable();
+        await slow.release();
+
+        // Assert
+        expect(watcher.received[0]).toMatchObject({ type: "welcome", durable: 0 });
+        expect(before).toBe(0);
+        expect(authority.durable()).toBe(1);
+        expect(watcher.received.at(-1)).toEqual({ type: "durable", revision: 1 });
+        expect(old.received.some((message) => message.type === "durable")).toBe(false);
+    });
+
+    it("should resolve a wait for durability once the save of that revision lands", async () => {
+        // Arrange
+        const slow = slowStorage();
+        const { authority, join } = await setup({ storage: slow.storage });
+        join(0).session.receive(change("$.data.total", 11));
+        let done = false;
+        const waiting = authority.whenDurable().then(() => (done = true));
+
+        // Act
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const early = done;
+        await slow.release();
+        await waiting;
+
+        // Assert
+        expect(early).toBe(false);
+        expect(done).toBe(true);
+    });
+
+    it("should never save an ephemeral path, push it marked to protocol 2 clients only, and not hold up the watermark", async () => {
+        // Arrange
+        const slow = slowStorage();
+        const { authority, join } = await setup({ storage: slow.storage, ephemeral: ["$.app.pointer"], initial: { app: { pointer: { x: 0 } }, data: { total: 10 } } });
+        const writer = join(0);
+        const watcher = join();
+        watcher.session.receive(hello2());
+        const old = join(0);
+
+        // Act: a second of pointer moves at 60 a second
+        for (let index = 1; index <= 60; index++) writer.session.receive(change("$.app.pointer.x", index));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const savesAfterPointer = slow.saves();
+        const pointerDurable = await Promise.race([authority.whenDurable().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 20))]);
+        writer.session.receive(change("$.data.total", 11));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await slow.release();
+        const stored = await slow.storage.load(NAMESPACE);
+
+        // Assert
+        expect(savesAfterPointer).toBe(0);
+        expect(pointerDurable).toBe(true);
+        expect(authority.durable()).toBe(61);
+        expect(stored?.state).toEqual({ app: {}, data: { total: 11 } });
+        expect(stored?.log.map((logged) => logged.path)).toEqual(["$.data.total"]);
+        const pushed = (received: SyncMessage[]) => received.flatMap((message) => (message.type === "changes" ? message.changes : []));
+        expect(pushed(watcher.received)[0]).toMatchObject({ path: "$.app.pointer.x", ephemeral: true });
+        expect(pushed(old.received)[0]).not.toHaveProperty("ephemeral");
+    });
+});
+
+describe("a client of an authority with a watermark", () => {
+    it("should show its change at once as pending, and committed once the watermark passes it", async () => {
+        // Arrange
+        const inner = createMemoryNamespaceStorage();
+        let release!: () => void;
+        const storage: NamespaceStorage = { load: inner.load, save: async (namespace, stored) => {
+            await new Promise<void>((resolve) => (release = resolve));
+            await inner.save(namespace, stored);
+        } };
+        const authority = await createAuthority({ namespace: NAMESPACE, storage, initial: copyJson(STATE) });
+        const { transport } = createInProcessTransport(authority);
+        const store: Store<any> = createStore({});
+        const committed: string[][] = [];
+        const client = createSyncClient({ namespace: NAMESPACE, bridge: createStoreBridge(store), transport, backoff: () => 0, onDurable: (_revision, ids) => committed.push([...ids]) });
+        client.start();
+        await settle();
+
+        // Act
+        store.set("$.data.total", 42);
+        await settle();
+        const pending = { shown: store.get("$.data.total"), report: client.status() };
+        release();
+        await settle();
+
+        // Assert
+        expect(pending.shown).toBe(42);
+        expect(pending.report).toMatchObject({ waiting: 0, pending: 1 });
+        expect(client.status()).toMatchObject({ pending: 0 });
+        expect(client.durable()).toBe(1);
+        expect(committed.flat()).toHaveLength(1);
+        client.stop();
     });
 });
