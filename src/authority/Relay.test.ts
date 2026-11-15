@@ -183,6 +183,24 @@ describe("createRelay", () => {
         expect(one.state.value).toEqual({ o1: { total: 7 } });
     });
 
+    it("should serve a whole namespace (prefix $) from its cache", async () => {
+        // Arrange
+        const node = await owner();
+        const relay = createRelay(node.upstream, { sweep: false });
+        const first = follower("$");
+        relay.subscribe(ADDRESS, "$", undefined, first.listener);
+        await tick();
+        node.authority.write({ path: "$.data.other", op: "set", value: 2 });
+
+        // Act
+        const second = follower("$");
+        relay.subscribe(ADDRESS, "$", undefined, second.listener);
+
+        // Assert
+        expect(second.state.value).toEqual(node.authority.get("$"));
+        expect(first.state.value).toEqual(node.authority.get("$"));
+    });
+
     it("should pass on the durable watermark, and close the listeners of an address with no namespace", async () => {
         // Arrange
         const node = await owner();

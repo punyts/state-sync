@@ -97,6 +97,15 @@ export const projectChange = (change: RevisedChange, prefix: string): RevisedCha
 const applyTo = (root: { [key: string]: JsonValue }, change: RevisedChange): void => {
     const steps = segmentsOf(change.path);
     if (steps.length === 0) {
+        //a change of the whole namespace: the tree becomes its value
+        if (change.op !== "merge") {
+            for (const key of Object.keys(root)) {
+                delete root[key];
+            }
+        }
+        if (change.op !== "delete" && isObject(change.value)) {
+            Object.assign(root, copyJson(change.value));
+        }
         return;
     }
     let node: { [key: string]: JsonValue } = root;
