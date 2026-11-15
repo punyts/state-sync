@@ -142,6 +142,8 @@ export interface Authority {
     whenDurable: (revision?: number) => Promise<void>;
     /** Registers a listener for each advance of the durable watermark; returns the function that removes it */
     onDurable: (listener: (revision: number) => void) => () => void;
+    /** Registers a listener for the authority's close (a relay serving it onward ends its subscriptions); returns the function that removes it */
+    onClose: (listener: () => void) => () => void;
     /** A copy of the whole state, $.server included */
     state: () => { [key: string]: JsonValue };
     /** Resolves when every pending save is done */
@@ -230,6 +232,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
     let durableRevision = revision;
     const durableListeners = new Set<(revision: number) => void>();
+    const closeListeners = new Set<() => void>();
     const durableWaiters: { revision: number; resolve: () => void }[] = [];
 
     /** Moves the watermark forward, tells the protocol 2 sessions and resolves the waits it passes */
@@ -661,10 +664,20 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             }
             await saving;
         },
+        onClose: (listener) => {
+            closeListeners.add(listener);
+            return () => {
+                closeListeners.delete(listener);
+            };
+        },
         close: () => {
             for (const session of [...sessions]) {
                 sessions.delete(session);
                 session.connection.close();
+            }
+            for (const listener of [...closeListeners]) {
+                closeListeners.delete(listener);
+                listener();
             }
         }
     };

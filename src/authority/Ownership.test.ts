@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { Change } from "../Change.js";
 import { ClaimPolicy, createMemoryEpochStorage, createMemoryOwnershipStore, OwnerNode } from "./Ownership.js";
-import type { OwnerNodeOptions, WriteOutcome } from "./Ownership.js";
+import type { NamespaceHost, OwnerNodeOptions, WriteOutcome } from "./Ownership.js";
+import { createAuthority } from "./Authority.js";
+import type { Authority } from "./Authority.js";
 import { createRelay } from "./Relay.js";
 import type { RelayListener, Upstream } from "./Relay.js";
 
@@ -55,7 +57,7 @@ describe("OwnerNode", () => {
         expect(b.owned()).toEqual([ADDRESS]);
         expect(a.owned()).toEqual([]);
         expect((await ownership.get(ADDRESS))?.epoch).toBe(2);
-        const log = b.authorityOf(ADDRESS)?.get("$.data.log") as Record<string, number>;
+        const log = (await b.authorityOf(ADDRESS))?.get("$.data.log") as Record<string, number>;
         expect(Object.keys(log)).toHaveLength(41);
         // each node's writes keep the order they were sent in
         for (const via of [a, b]) {
@@ -72,14 +74,14 @@ describe("OwnerNode", () => {
         const a = node("a");
         const b = node("b");
         await a.write(ADDRESS, change("$.data.log.mine", "a"));
-        await a.authorityOf(ADDRESS)?.flush();
+        await (await a.authorityOf(ADDRESS))?.flush();
         clock += 2000;
 
         // Act
         const taken = await b.write(ADDRESS, change("$.data.log.theirs", "b"));
-        await b.authorityOf(ADDRESS)?.flush();
+        await (await b.authorityOf(ADDRESS))?.flush();
         const late = await a.write(ADDRESS, change("$.data.log.late", "a"));
-        await a.authorityOf(ADDRESS)?.flush();
+        await (await a.authorityOf(ADDRESS))?.flush();
 
         // Assert
         expect(taken).toMatchObject({ result: "applied", epoch: 2 });
@@ -124,8 +126,8 @@ describe("OwnerNode", () => {
         const a = node("a");
         const b = node("b");
         await a.write(ADDRESS, change("$.data.log.one", 1));
-        await a.authorityOf(ADDRESS)?.flush();
-        a.stop();
+        await (await a.authorityOf(ADDRESS))?.flush();
+        await a.stop();
         down("a");
 
         // Act
@@ -136,7 +138,86 @@ describe("OwnerNode", () => {
         // Assert
         expect(early).toEqual({ result: "rejected", reason: `${ADDRESS} is owned by another node` });
         expect(later).toMatchObject({ result: "applied", epoch: 2 });
-        expect(b.authorityOf(ADDRESS)?.get("$.data.log")).toEqual({ one: 1, three: 3 });
+        expect((await b.authorityOf(ADDRESS))?.get("$.data.log")).toEqual({ one: 1, three: 3 });
+    });
+});
+
+describe("OwnerNode with a host of its own", () => {
+    /** A host whose authorities can be restarted, as an app server restarts an instance over a changed definition */
+    const restartingHost = () => {
+        const storage = createMemoryEpochStorage();
+        const running = new Map<string, Promise<Authority>>();
+        const epochs: number[] = [];
+        const released: string[] = [];
+        const host: NamespaceHost = {
+            authority: (address, epoch) => {
+                let found = running.get(address);
+                if (found === undefined) {
+                    epochs.push(epoch);
+                    found = createAuthority({ namespace: "n", storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) }, initial: { data: {} }, createParents: true });
+                    running.set(address, found);
+                }
+                return found;
+            },
+            release: async (address) => {
+                released.push(address);
+                (await running.get(address))?.close();
+                running.delete(address);
+            }
+        };
+        const restart = async (address: string) => {
+            const authority = await running.get(address);
+            await authority?.flush();
+            authority?.close();
+            running.delete(address);
+        };
+        return { host, epochs, released, restart };
+    };
+
+    it("should order writes on the host's authority under the epoch it took, and again on the one that replaced it", async () => {
+        // Arrange
+        const ownership = createMemoryOwnershipStore();
+        const { host, epochs, restart } = restartingHost();
+        const node = new OwnerNode({ id: "a", ownership, host, link: () => undefined });
+
+        // Act
+        const first = await node.write(ADDRESS, change("$.data.one", 1));
+        await restart(ADDRESS);
+        const second = await node.write(ADDRESS, change("$.data.two", 2));
+
+        // Assert
+        expect(first).toMatchObject({ result: "applied", epoch: 1 });
+        expect(second).toMatchObject({ result: "applied", epoch: 1 });
+        expect(epochs).toEqual([1, 1]);
+        expect((await node.authorityOf(ADDRESS))?.get("$.data")).toEqual({ one: 1, two: 2 });
+        await node.stop();
+    });
+
+    it("should release the host's authority when it hands a namespace off, and tell where it is placed", async () => {
+        // Arrange
+        const ownership = createMemoryOwnershipStore();
+        const one = restartingHost();
+        const two = restartingHost();
+        const nodes = new Map<string, OwnerNode>();
+        const a = new OwnerNode({ id: "a", ownership, host: one.host, link: (id) => nodes.get(id) });
+        const b = new OwnerNode({ id: "b", ownership, host: two.host, link: (id) => nodes.get(id) });
+        nodes.set("a", a).set("b", b);
+
+        // Act
+        const first = await a.place(ADDRESS);
+        const fromB = await b.place(ADDRESS);
+        const claimed = await b.claim(ADDRESS);
+        const afterwards = await a.place(ADDRESS);
+
+        // Assert
+        expect(first).toEqual({ here: true, epoch: 1 });
+        expect(fromB).toEqual({ here: false, node: "a", epoch: 1 });
+        expect(claimed).toBe(true);
+        expect(one.released).toEqual([ADDRESS]);
+        expect(two.epochs).toEqual([2]);
+        expect(afterwards).toMatchObject({ here: false, node: "b" });
+        await a.stop();
+        await b.stop();
     });
 });
 

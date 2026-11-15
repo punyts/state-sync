@@ -201,6 +201,28 @@ describe("createRelay", () => {
         expect(first.state.value).toEqual(node.authority.get("$"));
     });
 
+    it("should keep $.server out of what it serves, and close its listeners when the authority closes", async () => {
+        // Arrange
+        const authority = await createAuthority({ namespace: "n", storage: { load: async () => undefined, save: async () => undefined }, initial: { data: { a: 1 } }, serverKey: new Uint8Array(32).fill(7), createParents: true });
+        authority.write({ op: "set", path: "$.server.secret", value: "s" });
+        const upstream = createAuthorityUpstream(async () => authority);
+        const seen: unknown[] = [];
+        let closed: string | undefined;
+
+        // Act
+        upstream.subscribe("alice/notes/user", "$", undefined, { welcome: (welcome) => seen.push(welcome), changes: (batch) => seen.push(batch), closed: (reason) => (closed = reason) });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        authority.write({ op: "set", path: "$.server.other", value: "t" });
+        authority.write({ op: "set", path: "$.data.b", value: 2 });
+        authority.close();
+
+        // Assert
+        expect(seen[0]).toMatchObject({ value: { data: { a: 1 } } });
+        expect(JSON.stringify(seen)).not.toContain("server");
+        expect(seen).toHaveLength(2);
+        expect(closed).toBe("the namespace's authority closed");
+    });
+
     it("should pass on the durable watermark, and close the listeners of an address with no namespace", async () => {
         // Arrange
         const node = await owner();

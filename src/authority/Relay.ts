@@ -1,5 +1,6 @@
 import { copyJson } from "../Apply.js";
 import type { JsonValue, RevisedChange } from "../Change.js";
+import { SERVER_PATH, isAtOrBelow } from "../Paths.js";
 import type { Authority } from "./Authority.js";
 import { checkAccess, RevocationList, type Access, type GrantKey } from "./Grants.js";
 
@@ -132,6 +133,12 @@ const applyTo = (root: { [key: string]: JsonValue }, change: RevisedChange): voi
  * changes under its prefix. A subscription with a revision the authority's log still reaches gets the changes since;
  * any other a snapshot of the prefix
  */
+/** A copy of the root without $.server */
+const withoutServer = (value: { [key: string]: JsonValue }): { [key: string]: JsonValue } => {
+    const { server: _server, ...rest } = value;
+    return rest;
+};
+
 export const createAuthorityUpstream = (resolve: (address: string) => Promise<Authority | undefined>, epochOf?: (address: string) => number | undefined): Upstream => ({
     subscribe: (address, prefix, revision, listener) => {
         let closed = false;
@@ -144,15 +151,28 @@ export const createAuthorityUpstream = (resolve: (address: string) => Promise<Au
                 listener.closed?.(`no namespace at ${address}`);
                 return;
             }
+            if (isAtOrBelow(prefix, SERVER_PATH)) {
+                listener.closed?.("$.server is never served");
+                return;
+            }
             let last = authority.revision();
             const since = revision === undefined ? undefined : authority.changesSince(revision);
             const epoch = epochOf?.(address);
             const durable = { durable: authority.durable(), ...(epoch === undefined ? {} : { epoch }) };
+            // $.server stays with the owner: it is never in a snapshot or a change that leaves it
+            const project = (list: readonly RevisedChange[]): RevisedChange[] => list.filter((change) => !isAtOrBelow(change.path, SERVER_PATH)).map((change) => projectChange(change, prefix)).filter((change) => change !== undefined);
+            const value = authority.get(prefix);
             listener.welcome(since === undefined
-                ? { revision: last, value: authority.get(prefix), ...durable }
-                : { revision: last, previous: revision as number, changes: since.map((change) => projectChange(change, prefix)).filter((change) => change !== undefined), ...durable });
+                ? { revision: last, value: prefix === "$" && isObject(value) ? withoutServer(value) : value, ...durable }
+                : { revision: last, previous: revision as number, changes: project(since), ...durable });
+            removers.push(authority.onClose(() => {
+                if (!closed) {
+                    closed = true;
+                    listener.closed?.("the namespace's authority closed");
+                }
+            }));
             removers.push(authority.onChanges((changes) => {
-                const projected = changes.map((change) => projectChange(change, prefix)).filter((change) => change !== undefined);
+                const projected = project(changes);
                 const to = (changes[changes.length - 1] as RevisedChange).revision;
                 if (projected.length === 0) {
                     //nothing under the prefix: the listener's revision stays where it is

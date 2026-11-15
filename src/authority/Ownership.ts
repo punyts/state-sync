@@ -1,7 +1,7 @@
 import type { Change, JsonValue } from "../Change.js";
 import type { SyncMessage } from "../Messages.js";
 import { createAuthority, type Authority, type AuthoritySession } from "./Authority.js";
-import type { NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
+import type { StoredNamespace } from "./NamespaceStorage.js";
 
 /** Which node holds a namespace's authority, under which epoch, and until when its lease runs */
 export interface OwnershipRecord {
@@ -170,19 +170,50 @@ export interface Handoff {
     readonly queued: ReadonlyArray<{ readonly change: Change; readonly done: (outcome: WriteOutcome) => void }>;
 }
 
+/**
+ * Another owner node as this one reaches it: the `OwnerNode` itself in one process, or its side of a link over the mesh
+ * (`@punyts/statenet`'s peer links)
+ */
+export interface NodePeer {
+    /** A write for a namespace, sent on by the node it came through (`via`) */
+    write(address: string, change: Change, via?: string): Promise<WriteOutcome>;
+    /** Asks the peer to take the namespace from its owner */
+    claim(address: string): Promise<boolean>;
+    /** The owner's side of a claim by `to` */
+    handoff(address: string, to: string): Promise<Handoff | undefined>;
+}
+
 /** The directory's view of a node: a link to it, or undefined when it is gone */
-export type NodeLink = (nodeId: string) => OwnerNode | undefined;
+export type NodeLink = (nodeId: string) => NodePeer | undefined;
+
+/**
+ * Where the namespaces an owner node orders live: by default a plain authority per namespace over the `EpochStorage`;
+ * a host with authorities of its own (an app's logic, its own storage) gives them here. A host fences its own saves:
+ * it must refuse to save under an epoch older than the newest the namespace was saved under
+ */
+export interface NamespaceHost {
+    /** The namespace's authority on this node, started (saving under `epoch`) when it is not running; it may be restarted between calls */
+    authority(address: string, epoch: number): Promise<Authority>;
+    /** This node stopped owning the namespace: close its authority */
+    release(address: string): Promise<void> | void;
+}
+
+/** Where a namespace is ordered, as `place` finds it */
+export type Placement = { readonly here: true; readonly epoch: number } | { readonly here: false; readonly node: string; readonly epoch: number };
 
 export interface OwnerNodeOptions {
     readonly id: string;
     readonly ownership: OwnershipStore;
-    readonly storage: EpochStorage;
+    /** Where a plain authority keeps its namespace; needed without a `host` */
+    readonly storage?: EpochStorage;
+    /** The authorities of a host that has its own; plain authorities over `storage` by default */
+    readonly host?: NamespaceHost;
     /** The other nodes this one can reach */
     readonly link: NodeLink;
     /** 10 seconds by default; the lease is renewed every third of it */
     readonly leaseMs?: number;
     readonly policy?: ClaimPolicy;
-    /** The state of a namespace nothing is stored for */
+    /** The state of a namespace nothing is stored for (plain authorities) */
     readonly initial?: (address: string) => { [key: string]: JsonValue };
     /** Tells when this node starts or stops owning a namespace, with the epoch */
     readonly onOwner?: (address: string, owning: boolean, epoch: number) => void;
@@ -192,14 +223,43 @@ export interface OwnerNodeOptions {
 }
 
 interface Hosted {
-    readonly authority: Authority;
     readonly epoch: number;
-    readonly session: AuthoritySession;
-    readonly waiting: Map<string, (outcome: WriteOutcome) => void>;
     /** False while handing off: writes queue for the new owner */
     ordering: boolean;
     readonly queue: Array<{ change: Change; done: (outcome: WriteOutcome) => void }>;
     timer?: ReturnType<typeof setInterval>;
+}
+
+/** The session an owner node orders changes through, on one authority (a restarted authority gets a new one) */
+interface Ordering {
+    readonly session: AuthoritySession;
+    readonly waiting: Map<string, (outcome: WriteOutcome) => void>;
+}
+
+/** Plain authorities over epoch storage, one per namespace: the host of an owner node that has none of its own */
+function plainHost(storage: EpochStorage, initial: (address: string) => { [key: string]: JsonValue }): NamespaceHost {
+    const running = new Map<string, Promise<Authority>>();
+    return {
+        authority: (address, epoch) => {
+            let found = running.get(address);
+            if (found === undefined) {
+                found = createAuthority({
+                    namespace: address.replace(/[^A-Za-z0-9_-]+/g, "_"),
+                    storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) },
+                    initial: initial(address),
+                    createParents: true
+                });
+                running.set(address, found);
+                found.catch(() => running.delete(address));
+            }
+            return found;
+        },
+        release: async (address) => {
+            const found = running.get(address);
+            running.delete(address);
+            (await found?.catch(() => undefined))?.close();
+        }
+    };
 }
 
 /**
@@ -208,15 +268,18 @@ interface Hosted {
  * owner. Ownership moves by a claim: the owner stops ordering and queues, waits until the namespace is durable up to its
  * last revision, and hands off the revision, its epoch and the queue; the claimant takes ownership with a
  * compare-and-swap on that epoch, loads the namespace from storage and applies the queue first. An owner whose lease
- * runs out stops at once, and its storage refuses its saves by epoch; another node takes over on the next write
+ * runs out stops at once, and its storage refuses its saves by epoch; another node takes over on the next write.
+ * The authorities are the host's (`NamespaceHost`): plain ones by default, or an app server's own
  */
-export class OwnerNode {
+export class OwnerNode implements NodePeer {
     readonly id: string;
     private readonly hosted = new Map<string, Hosted>();
     /** Namespaces this node is taking: writes wait for it */
     private readonly taking = new Map<string, Promise<Hosted | undefined>>();
     /** Where namespaces this node handed off went, until the store says so */
     private readonly movedTo = new Map<string, string>();
+    private readonly orderings = new WeakMap<Authority, Ordering>();
+    private readonly host: NamespaceHost;
     private readonly leaseMs: number;
     private stopped = false;
     private readonly now: () => number;
@@ -225,6 +288,10 @@ export class OwnerNode {
         this.id = options.id;
         this.leaseMs = options.leaseMs ?? 10_000;
         this.now = options.now ?? Date.now;
+        if (options.host === undefined && options.storage === undefined) {
+            throw new Error("An owner node needs a host or an epoch storage");
+        }
+        this.host = options.host ?? plainHost(options.storage as EpochStorage, (address) => options.initial?.(address) ?? {});
     }
 
     /** The namespaces this node owns now */
@@ -232,14 +299,48 @@ export class OwnerNode {
         return [...this.hosted.keys()];
     }
 
+    /** Whether this node owns a namespace now */
+    owns(address: string): boolean {
+        return this.hosted.has(address);
+    }
+
     /** The authority of a namespace this node owns */
-    authorityOf(address: string): Authority | undefined {
-        return this.hosted.get(address)?.authority;
+    async authorityOf(address: string): Promise<Authority | undefined> {
+        const hosted = this.hosted.get(address);
+        return hosted === undefined ? undefined : this.host.authority(address, hosted.epoch);
     }
 
     /** The epoch this node owns a namespace under, or undefined */
     epochOf(address: string): number | undefined {
         return this.hosted.get(address)?.epoch;
+    }
+
+    /**
+     * Where a namespace is ordered: here when this node owns it, or takes it because nobody holds it (or its owner
+     * lapsed or cannot be reached); otherwise the node that owns it
+     */
+    async place(address: string, attempt = 0): Promise<Placement> {
+        if (this.stopped) {
+            throw new Error(`node ${this.id} is stopped`);
+        }
+        const hosted = this.hosted.get(address) ?? (await this.taking.get(address));
+        if (hosted !== undefined && this.hosted.get(address) === hosted) {
+            return { here: true, epoch: hosted.epoch };
+        }
+        const record = await this.options.ownership.get(address);
+        const moved = this.movedTo.get(address);
+        const owner = moved ?? (record !== undefined && record.leaseUntil > this.now() ? record.node : undefined);
+        if (owner !== undefined && owner !== this.id && this.options.link(owner) !== undefined) {
+            return { here: false, node: owner, epoch: record?.epoch ?? 0 };
+        }
+        const taken = await this.take(address);
+        if (taken !== undefined) {
+            return { here: true, epoch: taken.epoch };
+        }
+        if (attempt < 2) {
+            return this.place(address, attempt + 1);
+        }
+        throw new Error(`${address} could not be placed`);
     }
 
     /**
@@ -256,7 +357,7 @@ export class OwnerNode {
             if (!hosted.ordering) {
                 return new Promise((done) => hosted.queue.push({ change, done }));
             }
-            const outcome = await this.order(hosted, change);
+            const outcome = await this.order(address, hosted, change);
             this.considerMove(address);
             return outcome;
         }
@@ -286,8 +387,12 @@ export class OwnerNode {
         if (this.hosted.has(address)) {
             return true;
         }
+        const pending = this.taking.get(address);
+        if (pending !== undefined) {
+            return (await pending) !== undefined;
+        }
         const record = await this.options.ownership.get(address);
-        if (record === undefined || record.leaseUntil <= this.now()) {
+        if (record === undefined || record.leaseUntil <= this.now() || record.node === this.id) {
             return (await this.take(address)) !== undefined;
         }
         const peer = this.options.link(record.node);
@@ -300,7 +405,7 @@ export class OwnerNode {
             if (handoff === undefined) {
                 return undefined;
             }
-            return this.host(address, handoff.epoch, handoff);
+            return this.hostAt(address, handoff.epoch, handoff);
         })();
         this.taking.set(address, taking);
         try {
@@ -328,22 +433,21 @@ export class OwnerNode {
             return undefined;
         }
         hosted.ordering = false;
-        await hosted.authority.whenDurable();
-        await hosted.authority.flush();
-        const revision = hosted.authority.revision();
+        const authority = await this.host.authority(address, hosted.epoch);
+        await authority.whenDurable();
+        await authority.flush();
+        const revision = authority.revision();
         this.movedTo.set(address, to);
-        this.release(address, hosted);
+        await this.release(address, hosted);
         this.options.policy?.moved(address);
         const queued = hosted.queue.splice(0);
         return { revision, epoch: hosted.epoch, queued };
     }
 
     /** Stops: every hosted namespace is released (its lease left to run out, as when a node is lost) */
-    stop(): void {
+    async stop(): Promise<void> {
         this.stopped = true;
-        for (const [address, hosted] of [...this.hosted]) {
-            this.release(address, hosted);
-        }
+        await Promise.all([...this.hosted].map(([address, hosted]) => this.release(address, hosted)));
     }
 
     /** Takes a namespace nobody holds (or whose owner lapsed) and hosts it at the next epoch */
@@ -352,7 +456,7 @@ export class OwnerNode {
         if (existing !== undefined) {
             return existing;
         }
-        const taking = this.host(address, undefined);
+        const taking = this.hostAt(address, undefined);
         this.taking.set(address, taking);
         try {
             return await taking;
@@ -362,16 +466,56 @@ export class OwnerNode {
         }
     }
 
-    /** Takes ownership (a compare-and-swap on `fromEpoch` for a handoff), loads the namespace and starts ordering */
-    private async host(address: string, fromEpoch: number | undefined, handoff?: Handoff): Promise<Hosted | undefined> {
+    /** Takes ownership (a compare-and-swap on `fromEpoch` for a handoff), starts the authority and starts ordering */
+    private async hostAt(address: string, fromEpoch: number | undefined, handoff?: Handoff): Promise<Hosted | undefined> {
         const record = await this.options.ownership.take(address, this.id, this.leaseMs, fromEpoch);
         if (record === undefined) {
             return undefined;
         }
-        const { storage } = this.options;
         const epoch = record.epoch;
-        const fenced: NamespaceStorage = { load: (namespace) => storage.load(namespace), save: (namespace, stored) => storage.save(namespace, stored, epoch) };
-        const authority = await createAuthority({ namespace: address.replace(/[^A-Za-z0-9_-]+/g, "_"), storage: { load: () => fenced.load(address), save: (_namespace, stored) => fenced.save(address, stored) }, initial: this.options.initial?.(address) ?? {}, createParents: true });
+        const hosted: Hosted = { epoch, ordering: true, queue: [] };
+        this.hosted.set(address, hosted);
+        this.movedTo.delete(address);
+        try {
+            await this.host.authority(address, epoch);
+        }
+        catch (error) {
+            this.hosted.delete(address);
+            throw error;
+        }
+        this.options.onOwner?.(address, true, epoch);
+        hosted.timer = setInterval(() => {
+            void this.options.ownership.renew(address, this.id, epoch, this.leaseMs).then((still) => {
+                if (!still && this.hosted.get(address) === hosted) {
+                    // lost ownership: stop ordering at once
+                    void this.release(address, hosted);
+                }
+            }, () => undefined);
+        }, this.options.renewEveryMs ?? Math.max(10, this.leaseMs / 3));
+        (hosted.timer as { unref?: () => void }).unref?.();
+        // the writes that waited during the handoff land first, in the order they arrived
+        for (const { change, done } of handoff?.queued ?? []) {
+            done(await this.order(address, hosted, change));
+        }
+        return hosted;
+    }
+
+    /** Orders one change at the namespace's authority, which applies a resent change once */
+    private async order(address: string, hosted: Hosted, change: Change): Promise<WriteOutcome> {
+        const authority = await this.host.authority(address, hosted.epoch);
+        const ordering = this.orderingOf(authority, hosted.epoch);
+        return new Promise((done) => {
+            ordering.waiting.set(change.id, done);
+            ordering.session.receive(JSON.stringify({ type: "change", change }));
+        });
+    }
+
+    /** The session this node orders through on an authority, connected on first use */
+    private orderingOf(authority: Authority, epoch: number): Ordering {
+        const found = this.orderings.get(authority);
+        if (found !== undefined) {
+            return found;
+        }
         const waiting = new Map<string, (outcome: WriteOutcome) => void>();
         const session = authority.connect({
             send: (text) => {
@@ -383,46 +527,31 @@ export class OwnerNode {
                 waiting.delete(message.id);
                 done?.(message.result === "rejected" ? { result: "rejected", reason: message.reason ?? "rejected" } : { result: message.result, revision: message.revision ?? 0, epoch, ...(message.value === undefined ? {} : { value: message.value }) });
             },
-            close: () => undefined
+            close: () => {
+                // the authority closed (released or restarted): what it had not answered is not known to be applied
+                for (const done of waiting.values()) {
+                    done({ result: "rejected", reason: "the namespace's authority closed" });
+                }
+                waiting.clear();
+                this.orderings.delete(authority);
+            }
         });
         session.receive(JSON.stringify({ type: "hello", namespace: authority.namespace, revision: authority.revision(), clientId: `node:${this.id}`, protocol: 2 }));
-        const hosted: Hosted = { authority, epoch, session, waiting, ordering: true, queue: [] };
-        this.hosted.set(address, hosted);
-        this.movedTo.delete(address);
-        this.options.onOwner?.(address, true, epoch);
-        hosted.timer = setInterval(() => {
-            void this.options.ownership.renew(address, this.id, epoch, this.leaseMs).then((still) => {
-                if (!still && this.hosted.get(address) === hosted) {
-                    // lost ownership: stop ordering at once
-                    this.release(address, hosted);
-                }
-            });
-        }, this.options.renewEveryMs ?? Math.max(10, this.leaseMs / 3));
-        (hosted.timer as { unref?: () => void }).unref?.();
-        // the writes that waited during the handoff land first, in the order they arrived
-        for (const { change, done } of handoff?.queued ?? []) {
-            done(await this.order(hosted, change));
-        }
-        return hosted;
+        const ordering: Ordering = { session, waiting };
+        this.orderings.set(authority, ordering);
+        return ordering;
     }
 
-    /** Orders one change at the namespace's authority, which applies a resent change once */
-    private order(hosted: Hosted, change: Change): Promise<WriteOutcome> {
-        return new Promise((done) => {
-            hosted.waiting.set(change.id, done);
-            hosted.session.receive(JSON.stringify({ type: "change", change }));
-        });
-    }
-
-    private release(address: string, hosted: Hosted): void {
+    private async release(address: string, hosted: Hosted): Promise<void> {
         if (hosted.timer !== undefined) {
             clearInterval(hosted.timer);
         }
-        hosted.authority.close();
-        if (this.hosted.get(address) === hosted) {
-            this.hosted.delete(address);
-            this.options.onOwner?.(address, false, hosted.epoch);
+        if (this.hosted.get(address) !== hosted) {
+            return;
         }
+        this.hosted.delete(address);
+        await this.host.release(address);
+        this.options.onOwner?.(address, false, hosted.epoch);
     }
 
     /** Moves ownership to the node that sends most of the writes, when the policy says it pays */
