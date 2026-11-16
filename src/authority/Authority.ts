@@ -1,0 +1,684 @@
+import { report } from "@punyts/core";
+import { createStore, type Store } from "@punyts/state";
+import { applyChange, copyJson } from "../Apply.js";
+import type { Change, JsonValue, RevisedChange } from "../Change.js";
+import type { AckMessage, HelloMessage, SyncMessage } from "../Messages.js";
+import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
+import { syncSnapshot } from "../Snapshot.js";
+import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
+import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
+import { isWithinPattern, touchesPattern } from "./Patterns.js";
+import { checkAccess, type Access, type GrantContext } from "./Grants.js";
+import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
+
+/** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
+export type AuthorityErrorCode = "wrong-namespace" | "no-hello";
+
+/** One client connection, as the caller's WebSocket server gives it */
+export interface AuthorityConnection {
+    send: (text: string) => void;
+    close: () => void;
+}
+
+/** What the caller passes the connection's events to */
+export interface AuthoritySession {
+    /** A message from the client, as text */
+    receive: (text: string) => void;
+    /** The connection closed */
+    close: () => void;
+}
+
+export interface AuthorityOptions {
+    namespace: string;
+    storage: NamespaceStorage;
+    /** The state at revision 0 when the storage holds nothing; empty by default */
+    initial?: { [key: string]: JsonValue };
+    /** The most recent changes kept for catching clients up; 1000 by default */
+    logLength?: number;
+    /** The most recent applied change ids remembered; 10000 by default, never fewer than the log */
+    appliedLength?: number;
+    limits?: Partial<SyncLimits>;
+    /**
+     * The 32-byte key $.server is encrypted with at rest (AES-256-GCM, a fresh nonce per value), from configuration;
+     * never stored or logged. Without it the authority keeps no $.server: a server write there throws, and a stored or
+     * initial state with one is refused
+     */
+    serverKey?: Uint8Array;
+    /**
+     * Accepts client changes and server writes below a parent that does not exist and creates the missing parents as
+     * empty objects; such a change is rejected (a write throws) by default. For sparse states, such as the articulation of
+     * $.app only where a user changed it
+     */
+    createParents?: boolean;
+    /**
+     * Ephemeral paths ("$."-prefixed, "*" matching one segment), such as a pointer or presence: a change at or below one
+     * is applied and pushed like any other, marked ephemeral, but never saved, and never holds up the durable watermark
+     */
+    ephemeral?: readonly string[];
+    /**
+     * Checks every client change against its connection's access (`connect`) at the owner node: the owner of `address`
+     * writes freely, anyone else needs a write grant that covers the path, checked at each change, so a revoked grant
+     * stops working at once. Without it the caller decides who connects
+     */
+    access?: { address: string; context: () => GrantContext };
+}
+
+/** What a change handler gets */
+export interface ChangeContext {
+    /** The client's change, as adjusted by the handlers before this one */
+    change: Change;
+    /** The client id of the hello on the change's connection */
+    clientId: string;
+    /** A copy of the value at a path of the current state, $.server included */
+    get: (path: string) => JsonValue | undefined;
+    /** One of the changes since the change's base is at, above or below its path, or the base is older than the log */
+    stale: boolean;
+    /** The logged changes after the change's base, oldest first */
+    since: RevisedChange[];
+}
+
+/** A handler's answer; undefined applies the change */
+export type ChangeVerdict =
+    | { result: "apply" }
+    | { result: "adjust"; value: JsonValue }
+    | { result: "reject"; reason: string }
+    | undefined;
+
+/** Server logic for client changes; synchronous, so changes stay in arrival order */
+export type ChangeHandler = (context: ChangeContext) => ChangeVerdict;
+
+/** Server logic that runs after a client change was committed and acknowledged */
+export type AppliedHandler = (change: RevisedChange, clientId: string) => void;
+
+/** Server logic for a client's emit */
+export type EmitHandler = (name: string, value: JsonValue | undefined, clientId: string) => void;
+
+/** A write made by server logic */
+export type ServerWrite = Pick<Change, "path" | "op" | "value">;
+
+export interface Authority {
+    readonly namespace: string;
+    /** Takes a client connection; the caller passes its messages and its close to the session */
+    connect: (connection: AuthorityConnection, access?: Access) => AuthoritySession;
+    /**
+     * Registers server logic for client changes at, below or above the paths a pattern matches ("*" matches one
+     * segment); returns the function that removes it
+     */
+    onChange: (pattern: string, handler: ChangeHandler) => () => void;
+    /**
+     * Registers server logic that runs after a client change was committed and acknowledged, with the change as
+     * applied; it may make server writes. Returns the function that removes it
+     */
+    onApplied: (handler: AppliedHandler) => () => void;
+    /** Registers server logic for client emits; returns the function that removes it */
+    onEmit: (handler: EmitHandler) => () => void;
+    /**
+     * Registers a listener for every change the authority commits, a client's or a server write, in the batches it
+     * pushes them in (a relay that serves the namespace onward); returns the function that removes it
+     */
+    onChanges: (listener: (changes: readonly RevisedChange[]) => void) => () => void;
+    /** The changes after a revision, from the log; undefined when the log no longer reaches back to it */
+    changesSince: (revision: number) => RevisedChange[] | undefined;
+    /**
+     * A server write: applied at once and pushed to every client with the next revision, which it returns. A write at or
+     * below $.server is applied and saved only: it takes no revision and never reaches a client. Throws for a path that
+     * is not a sync path or whose parent does not exist (unless createParents).
+     */
+    write: (write: ServerWrite) => number | undefined;
+    /**
+     * Server writes applied in order, as one push: the writes outside $.server reach every client in a single changes
+     * message. Every path is checked first, so a write that is not a sync path, or one at or below $.server without a
+     * serverKey, throws before anything is written. Returns the revision of each write (undefined under $.server)
+     */
+    writeAll: (writes: readonly ServerWrite[]) => (number | undefined)[];
+    /** A copy of the value at a path of the current state, $.server included; undefined when there is none */
+    get: (path: string) => JsonValue | undefined;
+    /** Sends a named event to every welcomed client */
+    emit: (name: string, value?: JsonValue) => void;
+    revision: () => number;
+    /** How far the namespace is durable: every change up to this revision is saved, or ephemeral */
+    durable: () => number;
+    /** Resolves once the namespace is durable up to a revision, the current one by default */
+    whenDurable: (revision?: number) => Promise<void>;
+    /** Registers a listener for each advance of the durable watermark; returns the function that removes it */
+    onDurable: (listener: (revision: number) => void) => () => void;
+    /** Registers a listener for the authority's close (a relay serving it onward ends its subscriptions); returns the function that removes it */
+    onClose: (listener: () => void) => () => void;
+    /** A copy of the whole state, $.server included */
+    state: () => { [key: string]: JsonValue };
+    /** Resolves when every pending save is done */
+    flush: () => Promise<void>;
+    /** Closes every connection */
+    close: () => void;
+}
+
+interface Session {
+    connection: AuthorityConnection;
+    /** Answered with welcome; only welcomed sessions get changes */
+    welcomed: boolean;
+    clientId: string;
+    /** The protocol of its hello: 2 gets the durable watermark */
+    protocol: number;
+    /** Who the connection is and the grant it presents, for `AuthorityOptions.access` */
+    access?: Access;
+}
+
+interface RegisteredHandler {
+    pattern: string;
+    handler: ChangeHandler;
+}
+
+/** The parent of a "$."-prefixed path; "$" for a top-level path */
+const parentOf = (path: string) => path.slice(0, path.lastIndexOf("."));
+
+const isComposite = (value: unknown) => typeof value === "object" && value !== null;
+
+/** The key of $.server in the state */
+const SERVER_KEY = SERVER_PATH.slice(2);
+
+/** The $.server value as the object of named values it must be, encrypted one by one */
+const serverBranch = (value: JsonValue | undefined, namespace: string): { [name: string]: JsonValue } => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${SERVER_PATH} of ${namespace} must be an object of named values`);
+    }
+    return value;
+};
+
+/**
+ * The authority of a namespace: it numbers each change it accepts with the next revision, acks it, pushes it to the
+ * other clients and catches reconnecting clients up from its log or with a snapshot. Change handlers (server logic) can
+ * apply, adjust or reject a change; without them a change is applied in arrival order, stale or not. $.server never
+ * leaves the authority.
+ * @param options
+ */
+export const createAuthority = async (options: AuthorityOptions): Promise<Authority> => {
+    const { namespace, storage } = options;
+    const logLength = Math.max(0, options.logLength ?? 1000);
+    const createParents = options.createParents === true;
+    const appliedLength = Math.max(logLength, options.appliedLength ?? 10_000);
+    const limits: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...options.limits };
+
+    const { serverKey } = options;
+    const stored = await storage.load(namespace);
+    const state = copyJson<{ [key: string]: JsonValue }>(stored?.state ?? options.initial ?? {});
+    if (state[SERVER_KEY] !== undefined) {
+        if (serverKey === undefined) {
+            throw new Error(`The state of ${namespace} has ${SERVER_PATH}, but the authority has no serverKey`);
+        }
+        if (stored !== undefined) {
+            state[SERVER_KEY] = decryptServerBranch(serverBranch(state[SERVER_KEY], namespace), serverKey, namespace);
+        }
+        else {
+            serverBranch(state[SERVER_KEY], namespace);
+        }
+    }
+    const store: Store<any> = createStore(state);
+    let revision = stored?.revision ?? 0;
+    const log: RevisedChange[] = (stored?.log ?? []).slice(-logLength);
+    //insertion order is the order the ids were applied in
+    const applied = new Map<string, number>((stored?.applied ?? []).map(({ id, revision }) => [id, revision]));
+
+    const sessions = new Set<Session>();
+    const handlers: RegisteredHandler[] = [];
+    const emitHandlers = new Set<EmitHandler>();
+    const appliedHandlers = new Set<AppliedHandler>();
+    const changeListeners = new Set<(changes: readonly RevisedChange[]) => void>();
+
+    let dirty = false;
+    let saving: Promise<void> = Promise.resolve();
+    let saveScheduled = false;
+    const ephemeral = options.ephemeral ?? [];
+    const isEphemeral = (path: string) => ephemeral.some((pattern) => isWithinPattern(pattern, path));
+    //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
+    let durableRevision = revision;
+    const durableListeners = new Set<(revision: number) => void>();
+    const closeListeners = new Set<() => void>();
+    const durableWaiters: { revision: number; resolve: () => void }[] = [];
+
+    /** Moves the watermark forward, tells the protocol 2 sessions and resolves the waits it passes */
+    const markDurable = (to: number) => {
+        if (to <= durableRevision) {
+            return;
+        }
+        durableRevision = to;
+        for (const session of sessions) {
+            if (session.welcomed && session.protocol >= 2) {
+                send(session, { type: "durable", revision: to });
+            }
+        }
+        for (const listener of durableListeners) {
+            listener(to);
+        }
+        for (let index = durableWaiters.length - 1; index >= 0; index--) {
+            const waiter = durableWaiters[index] as (typeof durableWaiters)[number];
+            if (waiter.revision <= to) {
+                durableWaiters.splice(index, 1);
+                waiter.resolve();
+            }
+        }
+    };
+
+    /** Removes the values at the paths an ephemeral pattern matches from a copy of the state */
+    const stripEphemeral = (state: { [key: string]: JsonValue }) => {
+        const strip = (node: JsonValue | undefined, segments: readonly string[]): void => {
+            if (node === null || typeof node !== "object" || Array.isArray(node) || segments.length === 0) {
+                return;
+            }
+            const [first, ...rest] = segments as [string, ...string[]];
+            for (const key of first === "*" ? Object.keys(node) : [first]) {
+                if (rest.length === 0) {
+                    delete node[key];
+                }
+                else {
+                    strip(node[key], rest);
+                }
+            }
+        };
+        for (const pattern of ephemeral) {
+            strip(state, pattern.split(".").slice(1));
+        }
+    };
+
+    const storedNamespace = (): StoredNamespace => {
+        const state = copyJson<{ [key: string]: JsonValue }>(store.get("$"));
+        if (state[SERVER_KEY] !== undefined && serverKey !== undefined) {
+            //$.server is only ever saved encrypted
+            state[SERVER_KEY] = encryptServerBranch(serverBranch(state[SERVER_KEY], namespace), serverKey, namespace);
+        }
+        stripEphemeral(state);
+        return {
+            state,
+            revision,
+            log: copyJson<RevisedChange[]>(log.filter((logged) => logged.ephemeral !== true)),
+            applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision }))
+        };
+    };
+
+    const save = async () => {
+        if (!dirty) {
+            return;
+        }
+        dirty = false;
+        const stored = storedNamespace();
+        try {
+            await storage.save(namespace, stored);
+            //nothing durable changed since this save took its copy: everything after it is ephemeral
+            markDurable(dirty ? stored.revision : revision);
+        }
+        catch (error) {
+            //tried again with the next change
+            dirty = true;
+            report("state-sync", "Could not save namespace %s at revision %s: %s", [namespace, revision, error instanceof Error ? error.message : String(error)]);
+        }
+    };
+
+    const scheduleSave = () => {
+        dirty = true;
+        if (saveScheduled) {
+            return;
+        }
+        saveScheduled = true;
+        queueMicrotask(() => {
+            saveScheduled = false;
+            //one save at a time; a save after the one running takes every change made meanwhile
+            saving = saving.then(save);
+        });
+    };
+
+    const send = (session: Session, message: SyncMessage) => {
+        try {
+            session.connection.send(JSON.stringify(message));
+        }
+        catch (error) {
+            report("state-sync", "Could not send a %s message in %s: %s", [message.type, namespace, error instanceof Error ? error.message : String(error)]);
+        }
+    };
+
+    const refuse = (session: Session, code: AuthorityErrorCode, message: string, close: boolean) => {
+        send(session, { type: "error", code, message });
+        if (close) {
+            sessions.delete(session);
+            session.connection.close();
+        }
+    };
+
+    const onHello = (session: Session, hello: HelloMessage) => {
+        if (hello.namespace !== namespace) {
+            refuse(session, "wrong-namespace", `this connection syncs ${namespace}`, true);
+            return;
+        }
+        const missing = revision - hello.revision;
+        //a client at 0 has nothing; one ahead of the authority has a state the authority does not know
+        const logged = hello.revision > 0 && missing >= 0 && missing <= log.length && missing <= limits.maxChanges;
+        const durable = hello.protocol >= 2 ? { durable: durableRevision } : {};
+        const changes = log.slice(log.length - missing);
+        send(session, logged
+            ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable }
+            : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable });
+        session.welcomed = true;
+        session.clientId = hello.clientId;
+        session.protocol = hello.protocol;
+    };
+
+    const ack = (session: Session, message: Omit<AckMessage, "type">) => send(session, { type: "ack", ...message });
+
+    /** Why the change cannot be applied to the store, or undefined when it can */
+    const missingParent = (change: Pick<Change, "path" | "op">): string | undefined => {
+        const parent = parentOf(change.path);
+        return change.op !== "delete" && !createParents && parent !== "$" && !isComposite(store.get(parent))
+            ? `${parent} does not exist`
+            : undefined;
+    };
+
+    /** Applies an accepted change at the next revision, logs it and pushes it to every welcomed session but the writer */
+    /** Applies and logs a change; pushes it to the other clients unless `batch` collects it for one push */
+    const commit = (change: Change, writer?: Session, batch?: RevisedChange[]): RevisedChange => {
+        applyChange(store, change);
+        revision++;
+        const passing = isEphemeral(change.path);
+        const revised: RevisedChange = passing ? { ...copyJson<Change>(change), revision, ephemeral: true } : { ...copyJson<Change>(change), revision };
+        log.push(revised);
+        if (log.length > logLength) {
+            log.splice(0, log.length - logLength);
+        }
+        //an ephemeral change is never saved, so it writes nothing and never holds up the watermark
+        if (!passing) {
+            scheduleSave();
+        }
+        if (batch !== undefined) {
+            batch.push(revised);
+        } else {
+            push([revised], writer);
+        }
+        return revised;
+    };
+
+    const push = (changes: RevisedChange[], writer?: Session) => {
+        if (changes.length === 0) {
+            return;
+        }
+        for (const listener of changeListeners) {
+            listener(copyJson<RevisedChange[]>(changes));
+        }
+        for (const other of sessions) {
+            if (other !== writer && other.welcomed) {
+                send(other, { type: "changes", changes: other.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change) });
+            }
+        }
+    };
+
+    /** Checks a server write before anything is written; throws with the reason */
+    const checkWrite = (write: ServerWrite) => {
+        if (!isSyncPath(write.path)) {
+            throw new Error(`${write.path} is not a sync path`);
+        }
+        if (isAtOrBelow(write.path, SERVER_PATH) && serverKey === undefined) {
+            throw new Error(`${SERVER_PATH} needs a serverKey, so it is never stored in plaintext`);
+        }
+    };
+
+    /** One server write; a write outside $.server is committed into `batch` or pushed at once */
+    const serverWrite = (write: ServerWrite, batch?: RevisedChange[]): number | undefined => {
+        checkWrite(write);
+        const missing = missingParent(write);
+        if (missing !== undefined) {
+            throw new Error(missing);
+        }
+        if (isAtOrBelow(write.path, SERVER_PATH)) {
+            if (write.path === SERVER_PATH && write.op !== "delete") {
+                serverBranch(write.value, namespace);
+            }
+            //server-only: no revision, so clients never see a gap
+            applyChange(store, write);
+            scheduleSave();
+            return undefined;
+        }
+        const change: Change = write.value === undefined
+            ? { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, base: revision }
+            : { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, value: copyJson(write.value), base: revision };
+        return commit(change, undefined, batch).revision;
+    };
+
+    /** Runs the handlers that touch the change in registration order: the change as adjusted, or the first rejection */
+    const runHandlers = (session: Session, received: Change): { change: Change; adjusted: boolean } | { reason: string } => {
+        let change = received;
+        let adjusted = false;
+        const since = log.filter((logged) => logged.revision > received.base);
+        const stale = received.base < revision - log.length ||
+            since.some((logged) => isAtOrBelow(logged.path, received.path) || isAtOrBelow(received.path, logged.path));
+        for (const { pattern, handler } of [...handlers]) {
+            if (!touchesPattern(pattern, received.path)) {
+                continue;
+            }
+            let verdict: ChangeVerdict;
+            try {
+                verdict = handler({
+                    change: copyJson<Change>(change),
+                    clientId: session.clientId,
+                    get: (path) => copyJson(store.get(path)),
+                    stale,
+                    since: copyJson<RevisedChange[]>(since)
+                });
+            }
+            catch (error) {
+                report("state-sync", "A change handler for %s in %s failed: %s", [pattern, namespace, error instanceof Error ? error.message : String(error)]);
+                return { reason: "server logic failed" };
+            }
+            if (verdict?.result === "reject") {
+                return { reason: verdict.reason };
+            }
+            if (verdict?.result === "adjust") {
+                change = { ...change, op: "set", value: copyJson(verdict.value) };
+                adjusted = true;
+            }
+        }
+        return { change, adjusted };
+    };
+
+    const onChange = (session: Session, received: Change) => {
+        const known = applied.get(received.id);
+        if (known !== undefined) {
+            ack(session, { id: received.id, result: "applied", revision: known });
+            return;
+        }
+        if (isAtOrBelow(received.path, SERVER_PATH)) {
+            ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
+            return;
+        }
+        if (options.access !== undefined) {
+            const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, options.access.context());
+            if (!allowed.ok) {
+                ack(session, { id: received.id, result: "rejected", reason: allowed.reason });
+                return;
+            }
+        }
+        const outcome = runHandlers(session, received);
+        if ("reason" in outcome) {
+            ack(session, { id: received.id, result: "rejected", reason: outcome.reason });
+            return;
+        }
+        const { change, adjusted } = outcome;
+        //checked after the handlers: an adjust turns a delete into a set
+        const missing = missingParent(change);
+        if (missing !== undefined) {
+            ack(session, { id: received.id, result: "rejected", reason: missing });
+            return;
+        }
+        const revised = commit(change, session);
+        const at = revised.revision;
+        applied.set(change.id, at);
+        if (applied.size > appliedLength) {
+            applied.delete(applied.keys().next().value!);
+        }
+        ack(session, adjusted
+            ? { id: change.id, result: "adjusted", revision: at, value: copyJson(change.value) }
+            : { id: change.id, result: "applied", revision: at });
+        for (const handler of [...appliedHandlers]) {
+            try {
+                handler(copyJson(revised), session.clientId);
+            } catch (error) {
+                report("state-sync", "Server logic after a change of %s failed: %s", [namespace, error instanceof Error ? error.message : String(error)]);
+            }
+        }
+    };
+
+    const onEmit = (session: Session, name: string, value: JsonValue | undefined) => {
+        for (const handler of [...emitHandlers]) {
+            try {
+                handler(name, copyJson(value), session.clientId);
+            }
+            catch (error) {
+                report("state-sync", "An emit handler for %s in %s failed: %s", [name, namespace, error instanceof Error ? error.message : String(error)]);
+            }
+        }
+    };
+
+    const receive = (session: Session, text: string) => {
+        if (!sessions.has(session)) {
+            return;
+        }
+        const parsed = parseMessage(text, limits);
+        if (!parsed.ok) {
+            send(session, parsed.error);
+            return;
+        }
+        const message = parsed.message;
+        switch (message.type) {
+            case "hello":
+                onHello(session, message);
+                return;
+            case "change":
+                if (!session.welcomed) {
+                    refuse(session, "no-hello", "send hello first", false);
+                    return;
+                }
+                onChange(session, message.change);
+                return;
+            case "emit":
+                if (!session.welcomed) {
+                    refuse(session, "no-hello", "send hello first", false);
+                    return;
+                }
+                onEmit(session, message.name, message.value);
+                return;
+            case "error":
+                report("state-sync", "A client of %s sent an error: %s %s", [namespace, message.code, message.message]);
+                return;
+            default:
+                report("state-sync", "Ignoring a %s message from a client of %s", [message.type, namespace]);
+        }
+    };
+
+    return {
+        namespace,
+        connect: (connection, access) => {
+            const session: Session = { connection, welcomed: false, clientId: "", protocol: 1, ...(access === undefined ? {} : { access }) };
+            sessions.add(session);
+            return {
+                receive: (text) => receive(session, text),
+                close: () => {
+                    sessions.delete(session);
+                }
+            };
+        },
+        onChange: (pattern, handler) => {
+            const registered: RegisteredHandler = { pattern, handler };
+            handlers.push(registered);
+            return () => {
+                const index = handlers.indexOf(registered);
+                if (index >= 0) {
+                    handlers.splice(index, 1);
+                }
+            };
+        },
+        onEmit: (handler) => {
+            emitHandlers.add(handler);
+            return () => {
+                emitHandlers.delete(handler);
+            };
+        },
+        onChanges: (listener) => {
+            changeListeners.add(listener);
+            return () => {
+                changeListeners.delete(listener);
+            };
+        },
+        changesSince: (since) => {
+            if (since === revision) {
+                return [];
+            }
+            //the log is complete back to the revision before its first change
+            const first = log[0];
+            if (since > revision || first === undefined || since < first.revision - 1) {
+                return undefined;
+            }
+            return copyJson<RevisedChange[]>(log.filter((logged) => logged.revision > since));
+        },
+        onApplied: (handler) => {
+            appliedHandlers.add(handler);
+            return () => {
+                appliedHandlers.delete(handler);
+            };
+        },
+        write: (write) => serverWrite(write),
+        writeAll: (writes) => {
+            writes.forEach(checkWrite);
+            const batch: RevisedChange[] = [];
+            try {
+                return writes.map((write) => serverWrite(write, batch));
+            } finally {
+                push(batch);
+            }
+        },
+        get: (path) => {
+            const value: unknown = path === "$" ? store.get("$") : store.get(path);
+            return value === undefined ? undefined : copyJson<JsonValue>(value as JsonValue);
+        },
+        emit: (name, value) => {
+            for (const session of sessions) {
+                if (session.welcomed) {
+                    send(session, value === undefined ? { type: "emit", name } : { type: "emit", name, value });
+                }
+            }
+        },
+        revision: () => revision,
+        durable: () => durableRevision,
+        whenDurable: (at = revision) => {
+            //a revision no durable change reached is durable already: only ephemeral changes came after the watermark
+            if (at <= durableRevision || (!dirty && !saveScheduled && log.filter((logged) => logged.revision > durableRevision && logged.revision <= at).every((logged) => logged.ephemeral === true))) {
+                return Promise.resolve();
+            }
+            return new Promise<void>((resolve) => durableWaiters.push({ revision: at, resolve }));
+        },
+        onDurable: (listener) => {
+            durableListeners.add(listener);
+            return () => {
+                durableListeners.delete(listener);
+            };
+        },
+        state: () => copyJson(store.get("$")),
+        flush: async () => {
+            if (saveScheduled) {
+                //the scheduled save was queued first, so it has joined the chain when this resolves
+                await new Promise<void>((resolve) => queueMicrotask(resolve));
+            }
+            await saving;
+        },
+        onClose: (listener) => {
+            closeListeners.add(listener);
+            return () => {
+                closeListeners.delete(listener);
+            };
+        },
+        close: () => {
+            for (const session of [...sessions]) {
+                sessions.delete(session);
+                session.connection.close();
+            }
+            for (const listener of [...closeListeners]) {
+                closeListeners.delete(listener);
+                listener();
+            }
+        }
+    };
+};

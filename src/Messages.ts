@@ -1,7 +1,10 @@
 import type { Change, JsonValue, RevisedChange } from "./Change.js";
 
-/** The version of the sync protocol, sent in hello */
-export const PROTOCOL_VERSION = 1;
+/** The version of the sync protocol a client sends in hello: 2 adds the durable watermark and ephemeral changes */
+export const PROTOCOL_VERSION = 2;
+
+/** The versions an authority speaks; a version 1 client gets neither durable messages nor a welcome's durable */
+export const PROTOCOL_VERSIONS: readonly number[] = [1, 2];
 
 /** A client opens a connection: the namespace it syncs and the revision its state is at (0 for none) */
 export interface HelloMessage {
@@ -22,12 +25,23 @@ export interface WelcomeMessage {
     revision: number;
     changes?: RevisedChange[];
     snapshot?: JsonValue;
+    /** Protocol 2: how far the namespace is durable, so changes up to it are committed */
+    durable?: number;
 }
 
 /** The authority sends changes other clients or server logic made */
 export interface ChangesMessage {
     type: "changes";
     changes: RevisedChange[];
+}
+
+/**
+ * Protocol 2: everything up to `revision` is durable (stored where it survives the authority), so a listener marks
+ * the changes up to it committed; the ones after it are pending
+ */
+export interface DurableMessage {
+    type: "durable";
+    revision: number;
 }
 
 /** A client sends one change to the authority */
@@ -73,10 +87,18 @@ export type SyncMessage =
     | ChangesMessage
     | ChangeMessage
     | AckMessage
+    | DurableMessage
     | EmitMessage
     | ErrorMessage;
 
 export type SyncMessageType = SyncMessage["type"];
+
+/**
+ * The error code of an authority, or of the server in front of it, that no longer lets this client have the namespace
+ * (its access was revoked): the client deletes what it keeps of the namespace and stops for good
+ * (`SyncClientOptions.onRevoked`)
+ */
+export const REVOKED_CODE = "revoked";
 
 /** The error codes parseMessage gives */
 export type SyncErrorCode = "invalid-json" | "too-large" | "invalid-message";

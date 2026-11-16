@@ -28,4 +28,6 @@ export interface Change {
 /** A change the authority accepted, with the revision it was given (1 or more) */
 export interface RevisedChange extends Change {
     revision: number;
+    /** Protocol 2: a change at an ephemeral path (a pointer, presence), which nothing stores and the watermark never waits for */
+    ephemeral?: true;
 }

@@ -18,14 +18,15 @@ const strip = ({ id: _id, ...change }: Change) => change;
 
 let capture: Capture | undefined;
 
-const setup = (base = 3) => {
+const setup = (base = 3, origins?: string[]) => {
     const store: Store<any> = createStore(JSON.parse(JSON.stringify(INITIAL)));
     const batches: Change[][] = [];
     let next = 0;
     capture = captureChanges(store, {
         base: () => base,
         onChanges: (changes) => batches.push(changes),
-        createId: () => `c${++next}`
+        createId: () => `c${++next}`,
+        ...(origins !== undefined && { origins })
     });
     const sent = () => {
         capture!.flush();
@@ -153,6 +154,15 @@ describe("captureChanges", () => {
             store.delete("$.data.list.0", { origin: "sync" });
 
             expect(sent()).toEqual([]);
+        });
+
+        it("should capture the writes of a listed origin and still skip other tagged writes", () => {
+            const { store, sent } = setup(3, ["logic"]);
+
+            store.set("$.data.total", 12, { origin: "logic" });
+            store.set("$.data.other", 1, { origin: "sync" });
+
+            expect(sent()).toEqual([{ path: "$.data.total", op: "set", value: 12, base: 3 }]);
         });
 
         it("should give nothing for $.runtime and $.server", () => {
