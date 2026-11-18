@@ -2,7 +2,8 @@
 
 State sync for `@punyts/state`: the change, the messages of the sync protocol with their validator, the capture that
 turns a store's own writes into changes, and the snapshot a store syncs from. Clients, authorities, the runtime and the
-statenet build on it. It has no transport, storage, DOM or Node dependency.
+statenet build on it. The main entry (`@punyts/state-sync`) has no transport, storage, DOM or Node dependency. The
+`@punyts/state-sync/authority` subpath is for Node only: its grants and server-data encryption import `node:crypto`.
 
 ## Modes
 
