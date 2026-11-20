@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **`FencedError` says what it refused.** It carries `address`, `epoch` (of the refused save) and `current` (the newest epoch the namespace was saved under), so statenet's aggregate can send a fence across the mesh and the node can throw it again.
 - **Owner nodes with a host of their own.** `OwnerNode` takes a `host` (`NamespaceHost`): an app server gives its own authorities (with its logic and storage, fencing its saves by the epoch it is given), and may restart them between writes; plain authorities over `storage` stay the default. `place(address)` says where a namespace is ordered (here, taking it when nobody holds it, or at its owner), `owns` whether it is here; `authorityOf` and `stop` are now async. The nodes an owner reaches are `NodePeer`s (`write`, `claim`, `handoff`), so a peer can be another process over the mesh. `Authority.onClose`; `createAuthorityUpstream` never serves `$.server` and closes its listeners when the authority closes. Tests: `Ownership.test.ts`, `Relay.test.ts`.
 - **Fix: a relay caches a whole namespace.** A subscription to `# Changelog
 

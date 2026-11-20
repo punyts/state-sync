@@ -35,7 +35,13 @@ export interface EpochStorage {
 
 /** Thrown by an `EpochStorage` for a save from an older epoch: the node lost ownership */
 export class FencedError extends Error {
-    constructor(address: string, epoch: number, current: number) {
+    constructor(
+        readonly address: string,
+        /** The epoch of the refused save */
+        readonly epoch: number,
+        /** The newest epoch the namespace was saved under */
+        readonly current: number
+    ) {
         super(`${address} is at epoch ${current}: a write from epoch ${epoch} is refused`);
         this.name = "FencedError";
     }
