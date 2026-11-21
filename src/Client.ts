@@ -1,4 +1,4 @@
-import { report } from "@punyts/core";
+import { isReported, report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "./Apply.js";
 import type { LocalChange, StoreBridge, SyncState } from "./Bridge.js";
@@ -93,6 +93,9 @@ interface OutboxEntry {
     /** Sent on the current connection and waiting for its ack */
     sent: boolean;
 }
+
+/** The category of the sync client's reports: namespaces, revisions, paths and counts, never values */
+const CATEGORY = "state-sync.client";
 
 const defaultBackoff = (attempt: number) => Math.min(30_000, 500 * 2 ** attempt);
 
@@ -201,7 +204,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             }
             catch (error) {
                 failed = true;
-                report("state-sync", "Could not save the %s of %s: %s", [part, namespace, error instanceof Error ? error.name : String(error)]);
+                report(CATEGORY, "Could not save the %s of %s: %s", [part, namespace, error instanceof Error ? error.name : String(error)]);
                 //the next save tries the part again
                 dirty[part] = true;
                 break;
@@ -277,15 +280,21 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             entry.sent = false;
         }
         setStatus("connecting");
+        report(CATEGORY, "Sent hello for %s at revision %s with %s changes waiting", [namespace, revision, outbox.length]);
         send({ type: "hello", namespace, revision, clientId, protocol: PROTOCOL_VERSION });
     };
 
     const sendOutbox = () => {
+        const sent: string[] = [];
         for (const entry of outbox) {
             if (!entry.sent) {
                 send({ type: "change", change: entry.change });
                 entry.sent = true;
+                sent.push(entry.change.path);
             }
+        }
+        if (sent.length > 0 && isReported(CATEGORY)) {
+            report(CATEGORY, "Sent %s changes of %s: %s", [sent.length, namespace, sent.join(", ")]);
         }
     };
 
@@ -302,6 +311,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             return;
         }
         const delay = backoff(attempt++);
+        report(CATEGORY, "Reconnecting to the authority of %s in %s ms (attempt %s)", [namespace, delay, attempt]);
         timer = setTimeout(() => {
             timer = undefined;
             connect();
@@ -309,6 +319,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     };
 
     const dropped = () => {
+        report(CATEGORY, "The connection to the authority of %s closed", [namespace]);
         closeConnection();
         for (const entry of outbox) {
             entry.sent = false;
@@ -319,7 +330,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
 
     const onWelcome = (message: WelcomeMessage) => {
         if (message.namespace !== namespace) {
-            report("state-sync", "Closing the connection: welcome for namespace %s, expected %s", [message.namespace, namespace]);
+            report(CATEGORY, "Closing the connection: welcome for namespace %s, expected %s", [message.namespace, namespace]);
             dropped();
             return;
         }
@@ -337,6 +348,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 removeFromOutbox(change.id);
             }
         }
+        const caughtUp = message.snapshot !== undefined ? "a snapshot" : `${message.changes?.length ?? 0} changes`;
+        report(CATEGORY, "Welcomed to %s at revision %s with %s, %s changes waiting", [namespace, message.revision, caughtUp, outbox.length]);
         revision = message.revision;
         markDirty("confirmed");
         bridge.load(visibleState());
@@ -355,11 +368,14 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
 
     /** A revision was skipped: ask for a catch-up again */
     const resync = () => {
-        report("state-sync", "Revision gap in %s at %s, catching up again", [namespace, revision]);
+        report(CATEGORY, "Revision gap in %s at %s, catching up again", [namespace, revision]);
         sendHello();
     };
 
     const onChanges = (message: ChangesMessage) => {
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Applying %s changes to %s: %s", [message.changes.length, namespace, message.changes.map((change) => `${change.path}@${change.revision}`).join(", ")]);
+        }
         for (const change of message.changes) {
             if (change.revision <= revision) {
                 continue;
@@ -383,6 +399,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             return;
         }
         const { path } = entry.change;
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "The authority %s the change of %s at %s", [message.result, namespace, path]);
+        }
         if (message.result === "rejected") {
             refresh(path);
             reportStatus();
@@ -418,7 +437,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     const receive = (text: string) => {
         const parsed = parseMessage(text, options.limits);
         if (!parsed.ok) {
-            report("state-sync", "Ignoring a message from the authority: %s", [parsed.error.message]);
+            report(CATEGORY, "Ignoring a message from the authority: %s", [parsed.error.message]);
             return;
         }
         const message = parsed.message;
@@ -449,10 +468,10 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                     revoke(message.message);
                     return;
                 }
-                report("state-sync", "The authority sent an error: %s %s", [message.code, message.message]);
+                report(CATEGORY, "The authority sent an error: %s %s", [message.code, message.message]);
                 return;
             default:
-                report("state-sync", "Ignoring a %s message from the authority", [message.type]);
+                report(CATEGORY, "Ignoring a %s message from the authority", [message.type]);
         }
     };
 
@@ -463,6 +482,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         }
         revoked = true;
         running = false;
+        report(CATEGORY, "Access to %s was revoked: stopped and forgot it", [namespace]);
         if (timer !== undefined) {
             clearTimeout(timer);
             timer = undefined;
@@ -487,6 +507,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         }
         const token = {};
         current = token;
+        report(CATEGORY, "Connecting to the authority of %s", [namespace]);
         //a reconnect stays offline until the connection opens
         try {
             connection = transport.connect({
@@ -508,12 +529,15 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             });
         }
         catch (error) {
-            report("state-sync", "Could not connect: %s", [error instanceof Error ? error.message : String(error)]);
+            report(CATEGORY, "Could not connect to the authority of %s: %s", [namespace, error instanceof Error ? error.name : String(error)]);
             dropped();
         }
     };
 
     const enqueue = (changes: LocalChange[]) => {
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Queued %s local changes of %s: %s", [changes.length, namespace, changes.map((change) => change.path).join(", ")]);
+        }
         for (const local of changes) {
             if (!isSyncPath(local.path) || isAtOrBelow(local.path, SERVER_PATH)) {
                 continue;
@@ -546,7 +570,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         const stored = localStore.read(namespace, "confirmed");
         if (!isConfirmedPart(stored)) {
             if (stored !== undefined) {
-                report("state-sync", "Ignoring the saved state of %s: it is not a state and revision", [namespace]);
+                report(CATEGORY, "Ignoring the saved state of %s: it is not a state and revision", [namespace]);
             }
             return undefined;
         }
@@ -558,7 +582,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 changes.push(parsed.message.change);
             }
             else {
-                report("state-sync", "Ignoring a saved change of %s that is not valid", [namespace]);
+                report(CATEGORY, "Ignoring a saved change of %s that is not valid", [namespace]);
             }
         }
         return { state: stored.state, revision: stored.revision, outbox: changes };
@@ -585,11 +609,13 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 return;
             }
             running = true;
-            const mounted = restore() ?? options.initial;
+            const restored = restore();
+            const mounted = restored ?? options.initial;
             if (mounted) {
                 mount(mounted);
                 bridge.load(visibleState());
             }
+            report(CATEGORY, "Started %s from %s at revision %s with %s changes waiting", [namespace, restored ? "the local store" : mounted ? "the initial state" : "nothing", revision, outbox.length]);
             unsubscribe = bridge.subscribe(enqueue);
             if (!transport) {
                 setStatus("standalone");
@@ -599,6 +625,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             connect();
         },
         stop: () => {
+            if (running) {
+                report(CATEGORY, "Stopped %s at revision %s with %s changes waiting", [namespace, revision, outbox.length]);
+            }
             running = false;
             if (timer !== undefined) {
                 clearTimeout(timer);

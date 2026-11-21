@@ -125,8 +125,9 @@ describe("authority $.server at rest", () => {
         await authority.flush();
 
         //@punyts/state's own debug reports are its business; the authority's are checked here
-        const reported = JSON.stringify(vi.mocked(report).mock.calls.filter(([channel]) => channel === "state-sync"));
-        expect(reported).toContain("disk full");
+        const reported = JSON.stringify(vi.mocked(report).mock.calls.filter(([channel]) => channel === "state-sync.authority"));
+        expect(reported).toContain("Could not save");
+        expect(reported).not.toContain("disk full");
         expect(reported).not.toContain("plaintext-secret");
         expect(reported).not.toContain(Buffer.from(KEY).toString("base64"));
     });

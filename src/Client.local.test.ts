@@ -161,7 +161,7 @@ describe("createSyncClient with a local store", () => {
             await network.settle();
             const failed = client.status();
             const kept = copyJson(store.get("$.data.total"));
-            const reported = vi.mocked(report).mock.calls.some(([category, message]) => category === "state-sync" && message.startsWith("Could not save"));
+            const reported = vi.mocked(report).mock.calls.some(([category, message]) => category === "state-sync.client" && message.startsWith("Could not save"));
 
             control.full = false;
             store.set("$.data.total", 13);

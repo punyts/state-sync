@@ -340,7 +340,7 @@ describe("server logic", () => {
             writer.session.receive(change("$.data.total", 1));
 
             expect(authority.state()).toMatchObject({ app: { page: 2 }, data: { total: 1 } });
-            expect(report).toHaveBeenCalledWith("state-sync", expect.stringContaining("after a change"), [NAMESPACE, "boom"]);
+            expect(report).toHaveBeenCalledWith("state-sync.authority", expect.stringContaining("after a change"), [NAMESPACE, "Error"]);
         });
     });
 

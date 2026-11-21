@@ -1,7 +1,11 @@
+import { report } from "@punyts/core";
 import type { Change, JsonValue } from "../Change.js";
 import type { SyncMessage } from "../Messages.js";
 import { createAuthority, type Authority, type AuthoritySession } from "./Authority.js";
 import type { StoredNamespace } from "./NamespaceStorage.js";
+
+/** The category of an owner node's reports: addresses, node ids and epochs, never values */
+const CATEGORY = "state-sync.ownership";
 
 /** Which node holds a namespace's authority, under which epoch, and until when its lease runs */
 export interface OwnershipRecord {
@@ -373,6 +377,7 @@ export class OwnerNode implements NodePeer {
         if (owner !== undefined && owner !== this.id) {
             const peer = this.options.link(owner);
             if (peer !== undefined) {
+                report(CATEGORY, "Node %s forwards a write of %s to its owner %s", [this.id, address, owner]);
                 return peer.write(address, change, via);
             }
         }
@@ -383,6 +388,7 @@ export class OwnerNode implements NodePeer {
             if (attempt < 2 && (await this.options.ownership.get(address))?.node !== record?.node) {
                 return this.write(address, change, via, attempt + 1);
             }
+            report(CATEGORY, "Node %s could not take %s: another node owns it", [this.id, address]);
             return { result: "rejected", reason: `${address} is owned by another node` };
         }
         return this.write(address, change, via, attempt);
@@ -403,8 +409,10 @@ export class OwnerNode implements NodePeer {
         }
         const peer = this.options.link(record.node);
         if (peer === undefined) {
+            report(CATEGORY, "Node %s cannot claim %s: its owner %s cannot be reached", [this.id, address, record.node]);
             return false;
         }
+        report(CATEGORY, "Node %s claims %s from %s", [this.id, address, record.node]);
         let handoff: Handoff | undefined;
         const taking = (async () => {
             handoff = await peer.handoff(address, this.id);
@@ -439,6 +447,7 @@ export class OwnerNode implements NodePeer {
             return undefined;
         }
         hosted.ordering = false;
+        const start = performance.now();
         const authority = await this.host.authority(address, hosted.epoch);
         await authority.whenDurable();
         await authority.flush();
@@ -447,6 +456,7 @@ export class OwnerNode implements NodePeer {
         await this.release(address, hosted);
         this.options.policy?.moved(address);
         const queued = hosted.queue.splice(0);
+        report(CATEGORY, "Node %s handed %s off to %s at revision %s under epoch %s in %s ms, %s writes queued", [this.id, address, to, revision, hosted.epoch, Math.round((performance.now() - start) * 10) / 10, queued.length]);
         return { revision, epoch: hosted.epoch, queued };
     }
 
@@ -476,8 +486,10 @@ export class OwnerNode implements NodePeer {
     private async hostAt(address: string, fromEpoch: number | undefined, handoff?: Handoff): Promise<Hosted | undefined> {
         const record = await this.options.ownership.take(address, this.id, this.leaseMs, fromEpoch);
         if (record === undefined) {
+            report(CATEGORY, "Node %s lost the race to own %s", [this.id, address]);
             return undefined;
         }
+        const start = performance.now();
         const epoch = record.epoch;
         const hosted: Hosted = { epoch, ordering: true, queue: [] };
         this.hosted.set(address, hosted);
@@ -489,11 +501,13 @@ export class OwnerNode implements NodePeer {
             this.hosted.delete(address);
             throw error;
         }
+        report(CATEGORY, "Node %s owns %s under epoch %s%s, its authority started in %s ms", [this.id, address, epoch, handoff === undefined ? "" : ` from a handoff at revision ${handoff.revision}`, Math.round((performance.now() - start) * 10) / 10]);
         this.options.onOwner?.(address, true, epoch);
         hosted.timer = setInterval(() => {
             void this.options.ownership.renew(address, this.id, epoch, this.leaseMs).then((still) => {
                 if (!still && this.hosted.get(address) === hosted) {
                     // lost ownership: stop ordering at once
+                    report(CATEGORY, "Node %s lost its lease of %s under epoch %s", [this.id, address, epoch]);
                     void this.release(address, hosted);
                 }
             }, () => undefined);
@@ -556,6 +570,7 @@ export class OwnerNode implements NodePeer {
             return;
         }
         this.hosted.delete(address);
+        report(CATEGORY, "Node %s released %s under epoch %s", [this.id, address, hosted.epoch]);
         await this.host.release(address);
         this.options.onOwner?.(address, false, hosted.epoch);
     }
@@ -568,6 +583,7 @@ export class OwnerNode implements NodePeer {
         }
         const peer = this.options.link(to);
         if (peer !== undefined) {
+            report(CATEGORY, "Node %s asks %s to claim %s: it sends most of the writes", [this.id, to, address]);
             void peer.claim(address);
         }
     }

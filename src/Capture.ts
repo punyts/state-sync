@@ -1,4 +1,4 @@
-import { report } from "@punyts/core";
+import { isReported, report } from "@punyts/core";
 import type { EventListenerFn, Store } from "@punyts/state";
 import type { Change, ChangeOp, JsonValue } from "./Change.js";
 import { copyJson } from "./Apply.js";
@@ -35,6 +35,9 @@ interface Pending {
 }
 
 const ALL_PATH = "$.$all";
+
+/** The category of capture's reports: paths and counts, never values */
+const CATEGORY = "state-sync.capture";
 
 const parentPath = (path: string) => path.slice(0, path.lastIndexOf("."));
 
@@ -80,6 +83,7 @@ export const captureChanges = (store: Store<any>, options: CaptureOptions): Capt
         if (pending.length === 0) {
             return;
         }
+        const written = pending.length;
         const batch = fold(pending);
         pending = [];
         const base = options.base();
@@ -100,6 +104,9 @@ export const captureChanges = (store: Store<any>, options: CaptureOptions): Capt
             }
             return change;
         });
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Captured %s changes (%s writes folded): %s", [changes.length, written - changes.length, changes.map((change) => `${change.op} ${change.path}`).join(", ")]);
+        }
         options.onChanges(changes);
     };
 
@@ -130,7 +137,9 @@ export const captureChanges = (store: Store<any>, options: CaptureOptions): Capt
         const inArray = parent !== "$" && Array.isArray(store.get(parent));
         const changed = inArray ? parent : path;
         if (!isSyncPath(changed)) {
-            report("state-sync", "Skipping a change at %s: not a sync path", [changed]);
+            if (isReported(CATEGORY)) {
+                report(CATEGORY, "Skipping a change at %s: not a sync path", [changed]);
+            }
             return;
         }
 

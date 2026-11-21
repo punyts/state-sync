@@ -246,11 +246,23 @@ const authority = await createAuthority({ namespace, storage, serverKey: Buffer.
   `initial` state with `$.server` is refused, so nothing is ever saved in plaintext. `$.server` itself must be an
   object of named values.
 - **The key stays in memory.** It is never put in the state, the stored namespace or a report. `@punyts/state` reports
-  written values under its `state-set-extended` category, so an app server holding secrets does not enable that
-  category (or `all`) for a listener that writes to a log.
+  a set's path under `state.set` and the kinds of its old and new value under `state.set.change`, never the value,
+  and state-sync's own reports (`state-sync.*`) hold paths, ids and counts only.
 - `encryptServerBranch` and `decryptServerBranch` are exported for a relay that forwards `$.server` (S1.12).
 - **Emit.** A client's `emit` (after `hello`) is handed to each `onEmit` handler with the client id and is not a change;
   a throwing handler is reported. `authority.emit(name, value?)` sends an `emit` to every welcomed client.
+
+## Reporting
+State-sync reports through `@punyts/core`'s reporter and adds no listener; a host turns the categories on
+(`state-sync.*` for all). Reports name namespaces, paths, ids, revisions, epochs, counts and durations, never a value.
+
+| Category | Reports |
+|---|---|
+| `state-sync.client` | start, connect, hello, welcome (snapshot or changes), changes queued, sent and applied by path, acks, gaps, reconnects and their delay, revoke, stop, failed saves to the local store |
+| `state-sync.capture` | each captured batch: op and path of every change, writes folded; paths skipped as not sync paths |
+| `state-sync.authority` | namespace load and save with ms, connects and leaves, welcomes, each change applied, adjusted or rejected (and why, by kind), server writes, handler failures by error name, close |
+| `state-sync.relay` | upstream subscriptions and welcomes, gaps, epochs, listeners joining and closing, leases and grants ending, changes passed on |
+| `state-sync.ownership` | taking, claiming, handing off (with ms), losing and releasing a namespace; writes forwarded to the owner |
 
 ## Security notes
 

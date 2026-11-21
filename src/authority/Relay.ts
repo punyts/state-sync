@@ -1,3 +1,4 @@
+import { isReported, report } from "@punyts/core";
 import { copyJson } from "../Apply.js";
 import type { JsonValue, RevisedChange } from "../Change.js";
 import { SERVER_PATH, isAtOrBelow } from "../Paths.js";
@@ -49,6 +50,9 @@ export interface Upstream {
      */
     subscribe(address: string, prefix: string, revision: number | undefined, listener: RelayListener, access?: Access): RelaySubscription;
 }
+
+/** The category of a relay's reports: addresses, prefixes, revisions, epochs and counts, never values */
+const CATEGORY = "state-sync.relay";
 
 const segmentsOf = (path: string): string[] => (path === "$" ? [] : path.slice(2).split("."));
 const isObject = (value: unknown): value is { [key: string]: JsonValue } => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -291,6 +295,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
 
     /** Closes one listener with a reason, and the entry's upstream subscription when it was the last */
     const remove = (entry: Entry, listening: Listening, reason: string) => {
+        report(CATEGORY, "Closed a listener of %s %s: %s", [entry.address, entry.prefix, reason]);
         entry.listeners.delete(listening);
         listening.listener.closed?.(reason);
         if (entry.listeners.size === 0 && entries.get(keyOf(entry.address, entry.prefix)) === entry) {
@@ -299,6 +304,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
     };
 
     const revoke = (grantId: string, expires: number) => {
+        report(CATEGORY, "Grant %s was revoked", [grantId]);
         revocations.add(grantId, expires);
         for (const entry of [...entries.values()]) {
             for (const listening of [...entry.listeners]) {
@@ -331,14 +337,17 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
 
     /** Subscribes upstream from the cache's revision, or for a snapshot when it has none or must start over (`fresh`) */
     const open = (entry: Entry, fresh = false) => {
+        report(CATEGORY, "Subscribing upstream to %s %s %s", [entry.address, entry.prefix, entry.ready && !fresh ? `from revision ${entry.revision}` : "for a snapshot"]);
         entry.upstream = upstream.subscribe(entry.address, entry.prefix, entry.ready && !fresh ? entry.revision : undefined, {
             welcome: (welcome) => {
                 if (welcome.epoch !== undefined) {
                     if (welcome.epoch < entry.epoch) {
+                        report(CATEGORY, "Refused a welcome of %s under epoch %s, older than %s", [entry.address, welcome.epoch, entry.epoch]);
                         return;
                     }
                     entry.epoch = welcome.epoch;
                 }
+                report(CATEGORY, "Upstream welcomed %s %s at revision %s with %s, %s listeners", [entry.address, entry.prefix, welcome.revision, "value" in welcome ? "a snapshot" : `${welcome.changes.length} changes`, entry.listeners.size]);
                 if ("value" in welcome) {
                     //a snapshot: the cache starts over at its revision
                     for (const key of Object.keys(entry.root)) {
@@ -380,6 +389,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             durable: (revision) => durableOf(entry, revision),
             revoked: (grantId, expires) => revoke(grantId, expires),
             closed: (reason) => {
+                report(CATEGORY, "Upstream closed %s %s: %s, %s listeners", [entry.address, entry.prefix, reason, entry.listeners.size]);
                 for (const listening of entry.listeners) {
                     listening.listener.closed?.(reason);
                 }
@@ -394,8 +404,10 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
         if (batch.epoch !== undefined && batch.epoch !== entry.epoch) {
             if (batch.epoch < entry.epoch) {
                 //an owner that lost ownership: what it ordered is refused
+                report(CATEGORY, "Refused changes of %s under epoch %s, older than %s", [entry.address, batch.epoch, entry.epoch]);
                 return;
             }
+            report(CATEGORY, "A new owner of %s under epoch %s: starting over from a snapshot", [entry.address, batch.epoch]);
             //a new owner started from the durable revision: what the old one ordered past it is gone, so start over
             entry.epoch = batch.epoch;
             entry.upstream?.close();
@@ -403,6 +415,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             return;
         }
         if (batch.previous !== entry.revision && !(catchingUp && batch.previous <= entry.revision)) {
+            report(CATEGORY, "Revision gap in %s %s: changes after %s at %s, subscribing again", [entry.address, entry.prefix, batch.previous, entry.revision]);
             entry.upstream?.close();
             open(entry);
             return;
@@ -422,6 +435,9 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
         entry.revision = batch.revision;
         if (fresh.length === 0) {
             return;
+        }
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Passing %s changes of %s %s to %s listeners: %s", [fresh.length, entry.address, entry.prefix, entry.listeners.size, fresh.map((change) => `${change.path}@${change.revision}`).join(", ")]);
         }
         for (const listening of entry.listeners) {
             if (listening.waiting !== undefined) {
@@ -445,6 +461,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
     };
 
     const drop = (entry: Entry) => {
+        report(CATEGORY, "Dropped %s %s: no listeners", [entry.address, entry.prefix]);
         entry.upstream?.close();
         entry.upstream = undefined;
         entries.delete(keyOf(entry.address, entry.prefix));
@@ -460,10 +477,12 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
         for (const entry of [...entries.values()]) {
             for (const listening of [...entry.listeners]) {
                 if (listening.expires <= at) {
+                    report(CATEGORY, "The lease of a listener of %s %s ran out", [entry.address, entry.prefix]);
                     entry.listeners.delete(listening);
                     listening.listener.closed?.("the lease ran out");
                 }
                 else if (listening.readEnds <= at) {
+                    report(CATEGORY, "The grant of a listener of %s %s expired", [entry.address, entry.prefix]);
                     entry.listeners.delete(listening);
                     listening.listener.closed?.("the grant expired");
                 }
@@ -481,6 +500,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             const allowed = readable(address, prefix, access);
             if (!allowed.ok) {
                 //refused at the first relay: nothing is subscribed upstream
+                report(CATEGORY, "Refused a subscription to %s %s: %s", [address, prefix, allowed.reason]);
                 queueMicrotask(() => listener.closed?.(allowed.reason));
                 return { renew: () => undefined, close: () => undefined };
             }
@@ -490,6 +510,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             if (entry === undefined) {
                 entry = { address, prefix, upstream: undefined, ready: false, revision: 0, durable: 0, epoch: 0, root: {}, log: [], logFrom: 0, listeners: new Set() };
                 entries.set(key, entry);
+                report(CATEGORY, "A first listener of %s %s from revision %s", [address, prefix, revision]);
                 entry.listeners.add({ ...listening, waiting: revision });
                 const added = [...entry.listeners][0] as Listening;
                 open(entry);
@@ -500,6 +521,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
                 return subscription(entry, added);
             }
             entry.listeners.add(listening);
+            report(CATEGORY, "A listener joined %s %s from revision %s: %s listeners", [address, prefix, revision, entry.listeners.size]);
             if (entry.ready) {
                 serve(entry, listening, revision);
             }

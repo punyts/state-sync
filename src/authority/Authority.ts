@@ -1,4 +1,4 @@
-import { report } from "@punyts/core";
+import { isReported, report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "../Apply.js";
 import type { Change, JsonValue, RevisedChange } from "../Change.js";
@@ -173,6 +173,15 @@ const parentOf = (path: string) => path.slice(0, path.lastIndexOf("."));
 
 const isComposite = (value: unknown) => typeof value === "object" && value !== null;
 
+/** The category of the authority's reports: namespaces, revisions, paths, ids and counts, never values */
+const CATEGORY = "state-sync.authority";
+
+/** Milliseconds since a start, rounded to a tenth */
+const elapsed = (start: number) => Math.round((performance.now() - start) * 10) / 10;
+
+/** The name of a thrown error: its message may hold values, so it is never reported */
+const errorName = (error: unknown) => (error instanceof Error ? error.name : typeof error);
+
 /** The key of $.server in the state */
 const SERVER_KEY = SERVER_PATH.slice(2);
 
@@ -199,6 +208,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const limits: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...options.limits };
 
     const { serverKey } = options;
+    const loadStart = performance.now();
     const stored = await storage.load(namespace);
     const state = copyJson<{ [key: string]: JsonValue }>(stored?.state ?? options.initial ?? {});
     if (state[SERVER_KEY] !== undefined) {
@@ -217,6 +227,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const log: RevisedChange[] = (stored?.log ?? []).slice(-logLength);
     //insertion order is the order the ids were applied in
     const applied = new Map<string, number>((stored?.applied ?? []).map(({ id, revision }) => [id, revision]));
+    report(CATEGORY, "Loaded %s at revision %s from %s in %s ms, %s changes logged", [namespace, revision, stored === undefined ? "the initial state" : "storage", elapsed(loadStart), log.length]);
 
     const sessions = new Set<Session>();
     const handlers: RegisteredHandler[] = [];
@@ -300,15 +311,17 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         dirty = false;
         const stored = storedNamespace();
+        const saveStart = performance.now();
         try {
             await storage.save(namespace, stored);
+            report(CATEGORY, "Saved %s at revision %s in %s ms", [namespace, stored.revision, elapsed(saveStart)]);
             //nothing durable changed since this save took its copy: everything after it is ephemeral
             markDurable(dirty ? stored.revision : revision);
         }
         catch (error) {
             //tried again with the next change
             dirty = true;
-            report("state-sync", "Could not save namespace %s at revision %s: %s", [namespace, revision, error instanceof Error ? error.message : String(error)]);
+            report(CATEGORY, "Could not save namespace %s at revision %s in %s ms: %s", [namespace, stored.revision, elapsed(saveStart), errorName(error)]);
         }
     };
 
@@ -330,7 +343,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             session.connection.send(JSON.stringify(message));
         }
         catch (error) {
-            report("state-sync", "Could not send a %s message in %s: %s", [message.type, namespace, error instanceof Error ? error.message : String(error)]);
+            report(CATEGORY, "Could not send a %s message in %s: %s", [message.type, namespace, errorName(error)]);
         }
     };
 
@@ -344,6 +357,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
 
     const onHello = (session: Session, hello: HelloMessage) => {
         if (hello.namespace !== namespace) {
+            report(CATEGORY, "Refused a hello for %s on a connection to %s", [hello.namespace, namespace]);
             refuse(session, "wrong-namespace", `this connection syncs ${namespace}`, true);
             return;
         }
@@ -358,6 +372,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         session.welcomed = true;
         session.clientId = hello.clientId;
         session.protocol = hello.protocol;
+        report(CATEGORY, "Welcomed client %s to %s at revision %s with %s (protocol %s)", [hello.clientId, namespace, revision, logged ? `${changes.length} changes since ${hello.revision}` : "a snapshot", hello.protocol]);
     };
 
     const ack = (session: Session, message: Omit<AckMessage, "type">) => send(session, { type: "ack", ...message });
@@ -436,7 +451,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const change: Change = write.value === undefined
             ? { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, base: revision }
             : { id: globalThis.crypto.randomUUID(), path: write.path, op: write.op, value: copyJson(write.value), base: revision };
-        return commit(change, undefined, batch).revision;
+        const at = commit(change, undefined, batch).revision;
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Server wrote %s %s in %s at revision %s", [change.op, change.path, namespace, at]);
+        }
+        return at;
     };
 
     /** Runs the handlers that touch the change in registration order: the change as adjusted, or the first rejection */
@@ -461,7 +480,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 });
             }
             catch (error) {
-                report("state-sync", "A change handler for %s in %s failed: %s", [pattern, namespace, error instanceof Error ? error.message : String(error)]);
+                report(CATEGORY, "A change handler for %s in %s failed: %s", [pattern, namespace, errorName(error)]);
                 return { reason: "server logic failed" };
             }
             if (verdict?.result === "reject") {
@@ -475,25 +494,38 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         return { change, adjusted };
     };
 
+    /** Reports a rejected client change by its path and the kind of refusal; a reason may come from server logic, so it is left out */
+    const rejected = (session: Session, received: Change, by: string) => {
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Rejected the change of client %s at %s in %s: %s", [session.clientId, received.path, namespace, by]);
+        }
+    };
+
     const onChange = (session: Session, received: Change) => {
         const known = applied.get(received.id);
         if (known !== undefined) {
+            if (isReported(CATEGORY)) {
+                report(CATEGORY, "Acked change %s again in %s: applied at revision %s", [received.id, namespace, known]);
+            }
             ack(session, { id: received.id, result: "applied", revision: known });
             return;
         }
         if (isAtOrBelow(received.path, SERVER_PATH)) {
+            rejected(session, received, "server-only");
             ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
             return;
         }
         if (options.access !== undefined) {
             const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, options.access.context());
             if (!allowed.ok) {
+                rejected(session, received, "no write access");
                 ack(session, { id: received.id, result: "rejected", reason: allowed.reason });
                 return;
             }
         }
         const outcome = runHandlers(session, received);
         if ("reason" in outcome) {
+            rejected(session, received, "server logic");
             ack(session, { id: received.id, result: "rejected", reason: outcome.reason });
             return;
         }
@@ -501,11 +533,15 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         //checked after the handlers: an adjust turns a delete into a set
         const missing = missingParent(change);
         if (missing !== undefined) {
+            rejected(session, received, "missing parent");
             ack(session, { id: received.id, result: "rejected", reason: missing });
             return;
         }
         const revised = commit(change, session);
         const at = revised.revision;
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "%s the %s of client %s at %s in %s at revision %s", [adjusted ? "Adjusted" : "Applied", change.op, session.clientId, change.path, namespace, at]);
+        }
         applied.set(change.id, at);
         if (applied.size > appliedLength) {
             applied.delete(applied.keys().next().value!);
@@ -517,7 +553,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             try {
                 handler(copyJson(revised), session.clientId);
             } catch (error) {
-                report("state-sync", "Server logic after a change of %s failed: %s", [namespace, error instanceof Error ? error.message : String(error)]);
+                report(CATEGORY, "Server logic after a change of %s failed: %s", [namespace, errorName(error)]);
             }
         }
     };
@@ -528,7 +564,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 handler(name, copyJson(value), session.clientId);
             }
             catch (error) {
-                report("state-sync", "An emit handler for %s in %s failed: %s", [name, namespace, error instanceof Error ? error.message : String(error)]);
+                report(CATEGORY, "An emit handler for %s in %s failed: %s", [name, namespace, errorName(error)]);
             }
         }
     };
@@ -539,6 +575,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         const parsed = parseMessage(text, limits);
         if (!parsed.ok) {
+            report(CATEGORY, "Refused a message from client %s of %s: %s", [session.clientId, namespace, parsed.error.code]);
             send(session, parsed.error);
             return;
         }
@@ -562,10 +599,10 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 onEmit(session, message.name, message.value);
                 return;
             case "error":
-                report("state-sync", "A client of %s sent an error: %s %s", [namespace, message.code, message.message]);
+                report(CATEGORY, "A client of %s sent the error %s", [namespace, message.code]);
                 return;
             default:
-                report("state-sync", "Ignoring a %s message from a client of %s", [message.type, namespace]);
+                report(CATEGORY, "Ignoring a %s message from a client of %s", [message.type, namespace]);
         }
     };
 
@@ -574,10 +611,13 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         connect: (connection, access) => {
             const session: Session = { connection, welcomed: false, clientId: "", protocol: 1, ...(access === undefined ? {} : { access }) };
             sessions.add(session);
+            report(CATEGORY, "A client connected to %s: %s connections", [namespace, sessions.size]);
             return {
                 receive: (text) => receive(session, text),
                 close: () => {
-                    sessions.delete(session);
+                    if (sessions.delete(session)) {
+                        report(CATEGORY, "Client %s left %s: %s connections", [session.clientId, namespace, sessions.size]);
+                    }
                 }
             };
         },
@@ -671,6 +711,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             };
         },
         close: () => {
+            report(CATEGORY, "Closed %s at revision %s with %s connections", [namespace, revision, sessions.size]);
             for (const session of [...sessions]) {
                 sessions.delete(session);
                 session.connection.close();
