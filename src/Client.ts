@@ -9,6 +9,7 @@ import {
     REVOKED_CODE,
     type AckMessage,
     type ChangesMessage,
+    type RejectionCode,
     type SyncMessage,
     type WelcomeMessage
 } from "./Messages.js";
@@ -36,6 +37,8 @@ export interface SyncStatusReport {
 export interface SyncRejection {
     path: string;
     reason: string;
+    /** The kind of refusal, when the authority gave one */
+    code?: RejectionCode;
 }
 
 /** What the client keeps between runs: the confirmed state, its revision and the outbox */
@@ -405,7 +408,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         if (message.result === "rejected") {
             refresh(path);
             reportStatus();
-            options.onRejected?.({ path, reason: message.reason ?? "" });
+            options.onRejected?.({ path, reason: message.reason ?? "", ...(message.code === undefined ? {} : { code: message.code }) });
             return;
         }
         const ackRevision = message.revision ?? 0;

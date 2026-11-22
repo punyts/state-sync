@@ -218,8 +218,8 @@ describe("createAuthority", () => {
             writer.session.receive(change("$.data.missing.total", 1, "set", "m"));
 
             expect(writer.received.slice(-2)).toEqual([
-                { type: "ack", id: "s", result: "rejected", reason: "$.server is server-only" },
-                { type: "ack", id: "m", result: "rejected", reason: "$.data.missing does not exist" }
+                { type: "ack", id: "s", result: "rejected", reason: "$.server is server-only", code: "invalid" },
+                { type: "ack", id: "m", result: "rejected", reason: "$.data.missing does not exist", code: "invalid" }
             ]);
             expect(authority.revision()).toBe(0);
             expect(reader.received).toHaveLength(1);
@@ -605,7 +605,7 @@ describe("createAuthority: the limit of unsaved changes", () => {
 
         // Assert
         expect(whileHeld).toEqual(["applied", "applied", "applied", "rejected"]);
-        expect(acks(writer.received)[3]).toMatchObject({ reason: `${NAMESPACE} holds 3 changes that are not saved yet` });
+        expect(acks(writer.received)[3]).toMatchObject({ reason: `${NAMESPACE} holds 3 changes that are not saved yet`, code: "unsaved" });
         expect(acks(writer.received).at(-1)).toMatchObject({ result: "applied", revision: 4 });
         expect(authority.get("$.data.total")).toBe(5);
         expect(vi.mocked(report)).toHaveBeenCalledWith("state-sync.authority", "Refusing writes to %s: %s changes are not saved yet", [NAMESPACE, 3]);

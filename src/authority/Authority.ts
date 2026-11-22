@@ -566,26 +566,26 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         if (isAtOrBelow(received.path, SERVER_PATH)) {
             rejected(session, received, "server-only");
-            ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
+            ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only`, code: "invalid" });
             return;
         }
         if (!isEphemeral(received.path) && holdsTooMany()) {
             rejected(session, received, "too many unsaved changes");
-            ack(session, { id: received.id, result: "rejected", reason: `${namespace} holds ${unsaved} changes that are not saved yet` });
+            ack(session, { id: received.id, result: "rejected", reason: `${namespace} holds ${unsaved} changes that are not saved yet`, code: "unsaved" });
             return;
         }
         if (options.access !== undefined) {
             const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, options.access.context());
             if (!allowed.ok) {
                 rejected(session, received, "no write access");
-                ack(session, { id: received.id, result: "rejected", reason: allowed.reason });
+                ack(session, { id: received.id, result: "rejected", reason: allowed.reason, code: "access" });
                 return;
             }
         }
         const outcome = runHandlers(session, received);
         if ("reason" in outcome) {
             rejected(session, received, "server logic");
-            ack(session, { id: received.id, result: "rejected", reason: outcome.reason });
+            ack(session, { id: received.id, result: "rejected", reason: outcome.reason, code: "logic" });
             return;
         }
         const { change, adjusted } = outcome;
@@ -593,7 +593,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const missing = missingParent(change);
         if (missing !== undefined) {
             rejected(session, received, "missing parent");
-            ack(session, { id: received.id, result: "rejected", reason: missing });
+            ack(session, { id: received.id, result: "rejected", reason: missing, code: "invalid" });
             return;
         }
         const revised = commit(change, session);

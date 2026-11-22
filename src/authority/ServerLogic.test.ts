@@ -69,7 +69,7 @@ describe("server logic", () => {
         it("should reject a change with the handler's reason and apply nothing", async () => {
             const { authority, join } = await setup();
             authority.onChange("$.data.expenses.*", ({ change }) =>
-                (change.value as { amount: number }).amount < 0 ? { result: "reject", reason: "amount must be positive" } : undefined);
+                (change.value as { amount: number }).amount < 0 ? { result: "reject", reason: "amount must be positive", code: "logic" } : undefined);
             const writer = join(0);
             const reader = join(0);
 
@@ -77,7 +77,7 @@ describe("server logic", () => {
             writer.session.receive(change("$.data.expenses.e2", { amount: 5 }, 0, "set", "y"));
 
             expect(writer.received.slice(-2)).toEqual([
-                { type: "ack", id: "x", result: "rejected", reason: "amount must be positive" },
+                { type: "ack", id: "x", result: "rejected", reason: "amount must be positive", code: "logic" },
                 { type: "ack", id: "y", result: "applied", revision: 1 }
             ]);
             expect(authority.state()).toMatchObject({ data: { expenses: { e2: { amount: 5 } } } });
@@ -101,7 +101,7 @@ describe("server logic", () => {
             writer.session.receive(change("$.data.total", 1, 0, "set", "x"));
 
             expect(seen).toEqual([1, 2]);
-            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "first" });
+            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "first", code: "logic" });
             expect(authority.revision()).toBe(0);
         });
 
@@ -180,7 +180,7 @@ describe("server logic", () => {
 
             writer.session.receive(change("$.data.total", 1, 0, "set", "x"));
 
-            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "server logic failed" });
+            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "server logic failed", code: "logic" });
             expect(vi.mocked(report).mock.calls.some(([, message]) => message.startsWith("A change handler"))).toBe(true);
         });
 
@@ -203,7 +203,7 @@ describe("server logic", () => {
 
             writer.session.receive(change("$.data.missing.total", undefined, 0, "delete", "x"));
 
-            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "$.data.missing does not exist" });
+            expect(writer.received.at(-1)).toEqual({ type: "ack", id: "x", result: "rejected", reason: "$.data.missing does not exist", code: "invalid" });
         });
     });
 
@@ -389,8 +389,8 @@ describe("server logic", () => {
             writer.session.receive(change("$.server.apiKey", "mine", 0, "set", "y"));
 
             expect(writer.received.slice(-2)).toEqual([
-                { type: "ack", id: "x", result: "rejected", reason: "$.server is server-only" },
-                { type: "ack", id: "y", result: "rejected", reason: "$.server is server-only" }
+                { type: "ack", id: "x", result: "rejected", reason: "$.server is server-only", code: "invalid" },
+                { type: "ack", id: "y", result: "rejected", reason: "$.server is server-only", code: "invalid" }
             ]);
             expect(handler).not.toHaveBeenCalled();
             expect(authority.state()).toMatchObject({ server: { apiKey: "secret-key" } });
@@ -480,7 +480,7 @@ describe("server logic", () => {
                 expect(store.get("$")).toEqual({ app: { page: 1 }, data: { total: 4, expenses: { e1: { amount: 4 } } } });
                 expect(client.state()).toMatchObject({ revision: 2, outbox: [] });
             }
-            expect(one.onRejected).toHaveBeenCalledWith({ path: "$.data.expenses.e2", reason: "negative" });
+            expect(one.onRejected).toHaveBeenCalledWith({ path: "$.data.expenses.e2", reason: "negative", code: "logic" });
         });
     });
 });

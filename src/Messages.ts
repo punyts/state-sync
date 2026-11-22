@@ -56,7 +56,7 @@ export type AckResult = "applied" | "adjusted" | "rejected";
  * The authority answers a change:
  * - applied: the change is in at revision
  * - adjusted: server logic changed it; value is what the path holds at revision
- * - rejected: the change is not in; reason says why
+ * - rejected: the change is not in; reason says why, and code what kind of refusal it is
  */
 export interface AckMessage {
     type: "ack";
@@ -65,7 +65,22 @@ export interface AckMessage {
     revision?: number;
     value?: JsonValue;
     reason?: string;
+    code?: RejectionCode;
 }
+
+/**
+ * The kind of a rejection, which a client may show without the reason (server logic may put values in a reason):
+ * - unsaved: the authority holds too many changes that are not saved yet; the same change may pass later
+ * - access: the connection may not write there
+ * - invalid: the change cannot be applied (a server-only path, a missing parent)
+ * - logic: server logic refused it
+ * - unavailable: no authority could take it (the node stopped, the owner moved, the authority closed)
+ */
+export const REJECTION_CODES = ["unsaved", "access", "invalid", "logic", "unavailable"] as const;
+export type RejectionCode = (typeof REJECTION_CODES)[number];
+
+/** True for a rejection code of the closed list */
+export const isRejectionCode = (value: unknown): value is RejectionCode => (REJECTION_CODES as readonly unknown[]).includes(value);
 
 /** A named event with an optional value, outside the state (a command, a notice) */
 export interface EmitMessage {

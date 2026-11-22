@@ -1,5 +1,5 @@
 import { CHANGE_OPS, type ChangeOp } from "./Change.js";
-import { PROTOCOL_VERSIONS, type ErrorMessage, type SyncErrorCode, type SyncMessage } from "./Messages.js";
+import { PROTOCOL_VERSIONS, REJECTION_CODES, isRejectionCode, type ErrorMessage, type SyncErrorCode, type SyncMessage } from "./Messages.js";
 import { isSyncPath } from "./Paths.js";
 
 /** The bounds parseMessage holds a message to */
@@ -233,7 +233,7 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
             checkChange(message.change, "change", limits, false);
             return;
         case "ack":
-            checkKeys(message, "ack", ["type", "id", "result"], ["revision", "value", "reason"]);
+            checkKeys(message, "ack", ["type", "id", "result"], ["revision", "value", "reason", "code"]);
             checkString(message.id, "id", limits.maxIdLength);
             if (message.result === "applied") {
                 checkKeys(message, "ack applied", ["type", "id", "result", "revision"]);
@@ -245,8 +245,11 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
                 checkJson(message.value, "value", limits.maxDepth);
             }
             else if (message.result === "rejected") {
-                checkKeys(message, "ack rejected", ["type", "id", "result", "reason"]);
+                checkKeys(message, "ack rejected", ["type", "id", "result", "reason"], ["code"]);
                 checkString(message.reason, "reason", limits.maxReasonLength);
+                if (message.code !== undefined && !isRejectionCode(message.code)) {
+                    fail(`code must be one of ${REJECTION_CODES.join(", ")}`);
+                }
             }
             else {
                 fail("result must be one of applied, adjusted, rejected");

@@ -1,6 +1,6 @@
 import { report } from "@punyts/core";
 import type { Change, JsonValue } from "../Change.js";
-import type { SyncMessage } from "../Messages.js";
+import type { RejectionCode, SyncMessage } from "../Messages.js";
 import { createAuthority, type Authority, type AuthoritySession } from "./Authority.js";
 import type { StoredNamespace } from "./NamespaceStorage.js";
 
@@ -171,7 +171,7 @@ export class ClaimPolicy {
 /** What a write gets: applied (or adjusted) at a revision under an epoch, or rejected */
 export type WriteOutcome =
     | { readonly result: "applied" | "adjusted"; readonly revision: number; readonly epoch: number; readonly value?: JsonValue }
-    | { readonly result: "rejected"; readonly reason: string };
+    | { readonly result: "rejected"; readonly reason: string; readonly code?: RejectionCode };
 
 /** What the old owner gives the new one in a handoff: the revision the namespace is durable at, its epoch, and the writes that arrived meanwhile */
 export interface Handoff {
@@ -359,7 +359,7 @@ export class OwnerNode implements NodePeer {
      */
     async write(address: string, change: Change, via: string = this.id, attempt = 0): Promise<WriteOutcome> {
         if (this.stopped) {
-            return { result: "rejected", reason: `node ${this.id} is stopped` };
+            return { result: "rejected", reason: `node ${this.id} is stopped`, code: "unavailable" };
         }
         const hosted = this.hosted.get(address) ?? (await this.taking.get(address));
         if (hosted !== undefined && this.hosted.get(address) === hosted) {
@@ -389,7 +389,7 @@ export class OwnerNode implements NodePeer {
                 return this.write(address, change, via, attempt + 1);
             }
             report(CATEGORY, "Node %s could not take %s: another node owns it", [this.id, address]);
-            return { result: "rejected", reason: `${address} is owned by another node` };
+            return { result: "rejected", reason: `${address} is owned by another node`, code: "unavailable" };
         }
         return this.write(address, change, via, attempt);
     }
@@ -545,12 +545,12 @@ export class OwnerNode implements NodePeer {
                 }
                 const done = waiting.get(message.id);
                 waiting.delete(message.id);
-                done?.(message.result === "rejected" ? { result: "rejected", reason: message.reason ?? "rejected" } : { result: message.result, revision: message.revision ?? 0, epoch, ...(message.value === undefined ? {} : { value: message.value }) });
+                done?.(message.result === "rejected" ? { result: "rejected", reason: message.reason ?? "rejected", ...(message.code === undefined ? {} : { code: message.code }) } : { result: message.result, revision: message.revision ?? 0, epoch, ...(message.value === undefined ? {} : { value: message.value }) });
             },
             close: () => {
                 // the authority closed (released or restarted): what it had not answered is not known to be applied
                 for (const done of waiting.values()) {
-                    done({ result: "rejected", reason: "the namespace's authority closed" });
+                    done({ result: "rejected", reason: "the namespace's authority closed", code: "unavailable" });
                 }
                 waiting.clear();
                 this.orderings.delete(authority);

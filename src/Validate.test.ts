@@ -216,6 +216,19 @@ describe("parseMessage", () => {
             expect(refusal({ ...VALID.rejected, revision: 4 }).message).toContain("unknown key \"revision\"");
         });
 
+        it("should take a rejection code from the closed list, and refuse another", () => {
+            // Arrange
+            const coded = { ...VALID.rejected, code: "unsaved" };
+
+            // Act
+            const parsed = parseMessage(JSON.stringify(coded));
+
+            // Assert
+            expect(parsed).toEqual({ ok: true, message: coded });
+            expect(refusal({ ...VALID.rejected, code: "busy" }).message).toContain("code must be one of unsaved, access, invalid, logic, unavailable");
+            expect(refusal({ ...VALID.applied, code: "unsaved" }).message).toContain("unknown key \"code\"");
+        });
+
         it("should refuse a reason in an applied ack", () => {
             expect(refusal({ ...VALID.applied, reason: "x" }).message).toContain("unknown key \"reason\"");
         });

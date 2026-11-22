@@ -136,7 +136,7 @@ describe("OwnerNode", () => {
         const later = await b.write(ADDRESS, change("$.data.log.three", 3));
 
         // Assert
-        expect(early).toEqual({ result: "rejected", reason: `${ADDRESS} is owned by another node` });
+        expect(early).toEqual({ result: "rejected", reason: `${ADDRESS} is owned by another node`, code: "unavailable" });
         expect(later).toMatchObject({ result: "applied", epoch: 2 });
         expect((await b.authorityOf(ADDRESS))?.get("$.data.log")).toEqual({ one: 1, three: 3 });
     });

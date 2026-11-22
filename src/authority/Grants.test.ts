@@ -161,8 +161,8 @@ describe("grants at the relay and the owner node", () => {
         const acks = received.filter((message) => message.type === "ack");
         expect(acks).toEqual([
             { type: "ack", id: "c1", result: "applied", revision: 1 },
-            { type: "ack", id: "c2", result: "rejected", reason: "the grant does not let bob write $.data.other of alice/notes/user" },
-            { type: "ack", id: "c3", result: "rejected", reason: "revoked" }
+            { type: "ack", id: "c2", result: "rejected", reason: "the grant does not let bob write $.data.other of alice/notes/user", code: "access" },
+            { type: "ack", id: "c3", result: "rejected", reason: "revoked", code: "access" }
         ]);
     });
 });

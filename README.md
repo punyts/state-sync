@@ -47,7 +47,7 @@ interface RevisedChange extends Change { revision: number }   // accepted by the
 | `welcome` | authority | `namespace`, `revision`, and exactly one of `changes` (since the client's revision) or `snapshot` |
 | `changes` | authority | `changes`: revised changes from other clients or server logic |
 | `change` | client | `change` |
-| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` |
+| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be |
 | `emit` | either | `name`, optional `value` |
 | `error` | either | `code`, `message` |
 
@@ -195,7 +195,7 @@ wss.on("connection", (socket) => {
   the adapter for tests.
 - **Unsaved changes.** While saves do not land (a node whose link to its aggregate is down holds its save until the
   link is back), changes are held. Past `maxUnsaved` held changes (10000 by default) a client change is acked
-  `rejected` and a server write throws (a `writeAll` batch is refused whole), until a save lands; ephemeral changes
+  `rejected` with code `unsaved` and a server write throws (a `writeAll` batch is refused whole), until a save lands; ephemeral changes
   still pass. A refusal tries a failed save again, since a refused change starts no save.
 - `authority.revision()`, `authority.state()` (a copy, `$.server` included), `authority.get(path)` (a copy of one value)
   and `authority.close()` (closes every connection).
