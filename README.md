@@ -193,6 +193,10 @@ wss.on("connection", (socket) => {
   })`, both async. After each change a save is scheduled, coalesced to a microtask, one save at a time; a failed save is
   reported and the next change saves again. `flush()` waits for the pending saves. `createMemoryNamespaceStorage()` is
   the adapter for tests.
+- **Unsaved changes.** While saves do not land (a node whose link to its aggregate is down holds its save until the
+  link is back), changes are held. Past `maxUnsaved` held changes (10000 by default) a client change is acked
+  `rejected` and a server write throws (a `writeAll` batch is refused whole), until a save lands; ephemeral changes
+  still pass. A refusal tries a failed save again, since a refused change starts no save.
 - `authority.revision()`, `authority.state()` (a copy, `$.server` included), `authority.get(path)` (a copy of one value)
   and `authority.close()` (closes every connection).
 

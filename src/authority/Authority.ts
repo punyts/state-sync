@@ -56,6 +56,12 @@ export interface AuthorityOptions {
      */
     ephemeral?: readonly string[];
     /**
+     * The most changes held that are not saved yet; 10000 by default. While a save does not land (a node with no link to
+     * its aggregate), changes are held; past this many a client change is rejected and a server write throws, ephemeral
+     * changes excepted, until a save lands. A refusal tries a failed save again
+     */
+    maxUnsaved?: number;
+    /**
      * Checks every client change against its connection's access (`connect`) at the owner node: the owner of `address`
      * writes freely, anyone else needs a write grant that covers the path, checked at each change, so a revoked grant
      * stops working at once. Without it the caller decides who connects
@@ -122,13 +128,14 @@ export interface Authority {
     /**
      * A server write: applied at once and pushed to every client with the next revision, which it returns. A write at or
      * below $.server is applied and saved only: it takes no revision and never reaches a client. Throws for a path that
-     * is not a sync path or whose parent does not exist (unless createParents).
+     * is not a sync path or whose parent does not exist (unless createParents), and for a write to be saved while
+     * `maxUnsaved` changes are held.
      */
     write: (write: ServerWrite) => number | undefined;
     /**
      * Server writes applied in order, as one push: the writes outside $.server reach every client in a single changes
      * message. Every path is checked first, so a write that is not a sync path, or one at or below $.server without a
-     * serverKey, throws before anything is written. Returns the revision of each write (undefined under $.server)
+     * serverKey, throws before anything is written, as it does while `maxUnsaved` changes are held. Returns the revision of each write (undefined under $.server)
      */
     writeAll: (writes: readonly ServerWrite[]) => (number | undefined)[];
     /** A copy of the value at a path of the current state, $.server included; undefined when there is none */
@@ -206,6 +213,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const createParents = options.createParents === true;
     const appliedLength = Math.max(logLength, options.appliedLength ?? 10_000);
     const limits: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...options.limits };
+    const maxUnsaved = Math.max(1, options.maxUnsaved ?? 10_000);
 
     const { serverKey } = options;
     const loadStart = performance.now();
@@ -238,6 +246,10 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     let dirty = false;
     let saving: Promise<void> = Promise.resolve();
     let saveScheduled = false;
+    let saveRunning = false;
+    /** The changes to be saved that no landed save holds yet, and whether writes are refused for them */
+    let unsaved = 0;
+    let refusing = false;
     const ephemeral = options.ephemeral ?? [];
     const isEphemeral = (path: string) => ephemeral.some((pattern) => isWithinPattern(pattern, path));
     //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
@@ -310,23 +322,57 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         dirty = false;
+        saveRunning = true;
+        const taking = unsaved;
         const stored = storedNamespace();
         const saveStart = performance.now();
         try {
             await storage.save(namespace, stored);
             report(CATEGORY, "Saved %s at revision %s in %s ms", [namespace, stored.revision, elapsed(saveStart)]);
+            unsaved -= taking;
+            if (refusing && unsaved < maxUnsaved) {
+                refusing = false;
+                report(CATEGORY, "Accepting writes to %s again: %s changes are not saved yet", [namespace, unsaved]);
+            }
             //nothing durable changed since this save took its copy: everything after it is ephemeral
             markDurable(dirty ? stored.revision : revision);
         }
         catch (error) {
-            //tried again with the next change
+            //tried again with the next change, or with the next refusal
             dirty = true;
             report(CATEGORY, "Could not save namespace %s at revision %s in %s ms: %s", [namespace, stored.revision, elapsed(saveStart), errorName(error)]);
         }
+        finally {
+            saveRunning = false;
+        }
     };
 
+    /** A change to be saved: counted, and saved after the save that runs */
     const scheduleSave = () => {
         dirty = true;
+        unsaved++;
+        queueSave();
+    };
+
+    /**
+     * Whether a change to be saved must be refused because `maxUnsaved` changes are held. A refused change starts no
+     * save, so a refusal tries a failed save again, unless one is running (a save held until the link is back)
+     */
+    const holdsTooMany = (): boolean => {
+        if (unsaved < maxUnsaved) {
+            return false;
+        }
+        if (!refusing) {
+            refusing = true;
+            report(CATEGORY, "Refusing writes to %s: %s changes are not saved yet", [namespace, unsaved]);
+        }
+        if (dirty && !saveRunning) {
+            queueSave();
+        }
+        return true;
+    };
+
+    const queueSave = () => {
         if (saveScheduled) {
             return;
         }
@@ -432,6 +478,14 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
     };
 
+    /** Throws when the writes hold a change to be saved and `maxUnsaved` changes are held; a batch is let in or refused whole */
+    const checkHeld = (writes: readonly ServerWrite[]) => {
+        const saved = writes.some((write) => isAtOrBelow(write.path, SERVER_PATH) || !isEphemeral(write.path));
+        if (saved && holdsTooMany()) {
+            throw new Error(`${namespace} holds ${unsaved} changes that are not saved yet`);
+        }
+    };
+
     /** One server write; a write outside $.server is committed into `batch` or pushed at once */
     const serverWrite = (write: ServerWrite, batch?: RevisedChange[]): number | undefined => {
         checkWrite(write);
@@ -513,6 +567,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         if (isAtOrBelow(received.path, SERVER_PATH)) {
             rejected(session, received, "server-only");
             ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only` });
+            return;
+        }
+        if (!isEphemeral(received.path) && holdsTooMany()) {
+            rejected(session, received, "too many unsaved changes");
+            ack(session, { id: received.id, result: "rejected", reason: `${namespace} holds ${unsaved} changes that are not saved yet` });
             return;
         }
         if (options.access !== undefined) {
@@ -660,9 +719,14 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 appliedHandlers.delete(handler);
             };
         },
-        write: (write) => serverWrite(write),
+        write: (write) => {
+            checkWrite(write);
+            checkHeld([write]);
+            return serverWrite(write);
+        },
         writeAll: (writes) => {
             writes.forEach(checkWrite);
+            checkHeld(writes);
             const batch: RevisedChange[] = [];
             try {
                 return writes.map((write) => serverWrite(write, batch));

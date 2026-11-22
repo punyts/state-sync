@@ -570,6 +570,105 @@ describe("createAuthority: durability", () => {
     });
 });
 
+describe("createAuthority: the limit of unsaved changes", () => {
+    /** Storage whose saves wait until released, as a node's do while it has no link to its aggregate */
+    const heldStorage = () => {
+        const inner = createMemoryNamespaceStorage();
+        const waiting: (() => void)[] = [];
+        const storage: NamespaceStorage = {
+            load: inner.load,
+            save: async (namespace, stored) => {
+                await new Promise<void>((resolve) => waiting.push(resolve));
+                await inner.save(namespace, stored);
+            }
+        };
+        return { storage, release: async () => {
+            for (const resolve of waiting.splice(0)) resolve();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        } };
+    };
+    const acks = (received: SyncMessage[]) => received.filter((message) => message.type === "ack");
+
+    it("should reject client changes past the limit while saves are held, and accept them once a save lands", async () => {
+        // Arrange
+        const held = heldStorage();
+        const { authority, join } = await setup({ storage: held.storage, maxUnsaved: 3 });
+        const writer = join(0);
+
+        // Act
+        for (let index = 1; index <= 4; index++) writer.session.receive(change("$.data.total", index));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const whileHeld = acks(writer.received).map((ack) => ack.result);
+        await held.release();
+        await held.release();
+        writer.session.receive(change("$.data.total", 5));
+
+        // Assert
+        expect(whileHeld).toEqual(["applied", "applied", "applied", "rejected"]);
+        expect(acks(writer.received)[3]).toMatchObject({ reason: `${NAMESPACE} holds 3 changes that are not saved yet` });
+        expect(acks(writer.received).at(-1)).toMatchObject({ result: "applied", revision: 4 });
+        expect(authority.get("$.data.total")).toBe(5);
+        expect(vi.mocked(report)).toHaveBeenCalledWith("state-sync.authority", "Refusing writes to %s: %s changes are not saved yet", [NAMESPACE, 3]);
+        expect(vi.mocked(report)).toHaveBeenCalledWith("state-sync.authority", "Accepting writes to %s again: %s changes are not saved yet", [NAMESPACE, 0]);
+    });
+
+    it("should refuse server writes past the limit, a batch whole, but let ephemeral changes through", async () => {
+        // Arrange
+        const held = heldStorage();
+        const { authority, join } = await setup({ storage: held.storage, maxUnsaved: 2, ephemeral: ["$.app.page"] });
+        const writer = join(0);
+        authority.write({ path: "$.data.total", op: "set", value: 1 });
+        authority.write({ path: "$.data.total", op: "set", value: 2 });
+
+        // Act
+        const single = () => authority.write({ path: "$.data.total", op: "set", value: 3 });
+        const batch = () => authority.writeAll([{ path: "$.app.page", op: "set", value: 2 }, { path: "$.data.total", op: "set", value: 3 }]);
+        const ephemeralWrite = authority.write({ path: "$.app.page", op: "set", value: 3 });
+        writer.session.receive(change("$.app.page", 4));
+
+        // Assert
+        expect(single).toThrow(`${NAMESPACE} holds 2 changes that are not saved yet`);
+        expect(batch).toThrow(`${NAMESPACE} holds 2 changes that are not saved yet`);
+        expect(ephemeralWrite).toBe(3);
+        expect(acks(writer.received).at(-1)).toMatchObject({ result: "applied" });
+        expect(authority.get("$.data.total")).toBe(2);
+        expect(authority.get("$.app.page")).toBe(4);
+        await held.release();
+    });
+
+    it("should try a failed save again when it refuses a change, since a refused change starts no save", async () => {
+        // Arrange
+        const inner = createMemoryNamespaceStorage();
+        let failing = true;
+        let saves = 0;
+        const storage: NamespaceStorage = {
+            load: inner.load,
+            save: async (namespace, stored) => {
+                saves++;
+                if (failing) throw new Error("no link");
+                await inner.save(namespace, stored);
+            }
+        };
+        const { authority, join } = await setup({ storage, maxUnsaved: 1 });
+        const writer = join(0);
+        writer.session.receive(change("$.data.total", 11));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        // Act
+        failing = false;
+        writer.session.receive(change("$.data.total", 12));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        writer.session.receive(change("$.data.total", 13));
+        await authority.flush();
+
+        // Assert
+        expect(acks(writer.received).map((ack) => ack.result)).toEqual(["applied", "rejected", "applied"]);
+        expect(saves).toBe(3);
+        expect(authority.durable()).toBe(2);
+        expect((await inner.load(NAMESPACE))?.state).toMatchObject({ data: { total: 13 } });
+    });
+});
+
 describe("a client of an authority with a watermark", () => {
     it("should show its change at once as pending, and committed once the watermark passes it", async () => {
         // Arrange
