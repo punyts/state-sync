@@ -29,7 +29,17 @@ export interface GrantClaims {
     readonly expires: number;
     /** The token of the grant it was passed on from */
     readonly parent?: string;
+    /**
+     * When the permission entry it was made from ends, for a token that lives shorter than its entry; absent, the entry
+     * ends when the token expires. A request made with it waits no longer than this, and no longer than the chain's
+     */
+    readonly lasts?: number;
+    /** How long a request made with it waits for a decision, at most `MAX_REQUEST_MS`; absent, the authority's own life */
+    readonly requestMs?: number;
 }
+
+/** The longest a request may wait for a decision: 30 days */
+export const MAX_REQUEST_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** A public key, as the directory gives it: whose it is, and when it stopped signing */
 export interface GrantKey {
@@ -49,7 +59,15 @@ export interface GrantContext {
 }
 
 export type GrantCheck =
-    | { readonly ok: true; readonly grant: GrantClaims; readonly chain: readonly string[] }
+    | {
+          readonly ok: true;
+          readonly grant: GrantClaims;
+          readonly chain: readonly string[];
+          /** When the earliest entry of the chain ends (`lasts`, else the token's expiry) */
+          readonly lasts: number;
+          /** The shortest `requestMs` of the chain; undefined when none says */
+          readonly requestMs?: number;
+      }
     | { readonly ok: false; readonly reason: string };
 
 /** The most grants in one chain */
@@ -156,7 +174,7 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
     if (key.retiredAt !== undefined && claims.issued > key.retiredAt) {
         return { ok: false, reason: "signed with a retired key" };
     }
-    if (claims.expires <= context.now) {
+    if (claims.expires <= context.now || (claims.lasts !== undefined && claims.lasts <= context.now)) {
         return { ok: false, reason: "expired" };
     }
     if (context.revoked?.(claims.entry) === true) {
@@ -166,7 +184,7 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
         if (claims.issuer !== claims.owner) {
             return { ok: false, reason: "a grant must come from the owner, or be passed on from one that does" };
         }
-        return { ok: true, grant: claims, chain: [claims.entry] };
+        return { ok: true, grant: claims, chain: [claims.entry], ...lifeOf(claims) };
     }
     const parent = verifyGrant(claims.parent, context, depth + 1);
     if (!parent.ok) {
@@ -179,7 +197,15 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
     if (from.owner !== claims.owner || !patternContains(grantPattern(from.pattern) as PathPattern, pattern) || !claims.rights.every((right) => from.rights.includes(right)) || claims.expires > from.expires) {
         return { ok: false, reason: "wider than the grant it was passed on from" };
     }
-    return { ok: true, grant: claims, chain: [claims.entry, ...parent.chain] };
+    const own = lifeOf(claims);
+    const requestMs = own.requestMs === undefined ? parent.requestMs : parent.requestMs === undefined ? own.requestMs : Math.min(own.requestMs, parent.requestMs);
+    return { ok: true, grant: claims, chain: [claims.entry, ...parent.chain], lasts: Math.min(own.lasts, parent.lasts), ...(requestMs !== undefined && { requestMs }) };
+};
+
+/** How long a grant's entry lasts and how long its requests wait, as one grant of a chain says */
+const lifeOf = (claims: GrantClaims): { lasts: number; requestMs?: number } => {
+    const requestMs = typeof claims.requestMs === "number" && claims.requestMs > 0 ? Math.min(claims.requestMs, MAX_REQUEST_MS) : undefined;
+    return { lasts: typeof claims.lasts === "number" ? claims.lasts : claims.expires, ...(requestMs !== undefined && { requestMs }) };
 };
 
 /** Who is asking, and the grant they present: the owner of an address needs none for it */
@@ -193,6 +219,10 @@ export interface AccessAllowed {
     readonly ok: true;
     /** When the right lapses: the grant's expiry; Infinity for the owner */
     readonly expires: number;
+    /** When the entries the right rests on end, which a request made with it waits no longer than; Infinity for the owner */
+    readonly lasts: number;
+    /** How long a request made with it waits, from its grants; undefined for the authority's own life */
+    readonly requestMs?: number;
     /** The entries the right rests on */
     readonly chain: readonly string[];
     /**
@@ -210,7 +240,7 @@ export interface AccessAllowed {
 export const checkAccess = (access: Access | undefined, need: { readonly address: string; readonly path: string; readonly right: GrantRight }, context: GrantContext): AccessAllowed | { readonly ok: false; readonly reason: string } => {
     const at = addressPath(need.address, need.path);
     if (access !== undefined && access.subject === at.owner) {
-        return { ok: true, expires: Number.POSITIVE_INFINITY, chain: [] };
+        return { ok: true, expires: Number.POSITIVE_INFINITY, lasts: Number.POSITIVE_INFINITY, chain: [] };
     }
     if (access?.grant === undefined) {
         return { ok: false, reason: `a ${need.right} of ${need.address} needs a grant` };
@@ -224,7 +254,14 @@ export const checkAccess = (access: Access | undefined, need: { readonly address
     if (reach === "none" || (reach === "below" && need.right !== "read")) {
         return { ok: false, reason: `the grant does not let ${access.subject} ${need.right} ${need.path} of ${need.address}` };
     }
-    return { ok: true, expires: grant.expires, chain: checked.chain, ...(reach === "below" ? { cut: grantPattern(grant.pattern) as PathPattern } : {}) };
+    return {
+        ok: true,
+        expires: grant.expires,
+        lasts: checked.lasts,
+        ...(checked.requestMs !== undefined && { requestMs: checked.requestMs }),
+        chain: checked.chain,
+        ...(reach === "below" ? { cut: grantPattern(grant.pattern) as PathPattern } : {})
+    };
 };
 
 /** Revoked entries, each kept until the grants made from it would have expired */

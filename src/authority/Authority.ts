@@ -583,7 +583,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         const at = now();
-        const request: StoredRequest = { change: copyJson<Change>(received), clientId: session.clientId, by, chain: [...allowed.chain], at, until: Math.min(at + lifeMs, allowed.expires), status: "pending" };
+        const request: StoredRequest = { change: copyJson<Change>(received), clientId: session.clientId, by, chain: [...allowed.chain], at, until: Math.min(at + (allowed.requestMs ?? lifeMs), allowed.lasts), status: "pending" };
         requests.set(received.id, request);
         scheduleSave();
         if (isReported(CATEGORY)) {

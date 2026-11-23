@@ -193,6 +193,32 @@ describe("requests", () => {
         expect(authority.requests()).toEqual([]);
     });
 
+    it("should keep a request past its token's expiry for the grant's requestMs, within the entry's lasts", async () => {
+        // Arrange: tokens of an hour from entries that last on, one whose requests wait 2 days, one whose entry ends in 1
+        const { authority, alice, clock, join } = await setup();
+        const bob = join("bob", grantOf(alice.privateKey, ["request"], { expires: START + HOUR, lasts: START + 30 * DAY, requestMs: 2 * DAY }));
+        const carol = join("carol", grantOf(alice.privateKey, ["request"], { subject: "carol", expires: START + HOUR, lasts: START + DAY, requestMs: 5 * DAY }));
+        bob.session.receive(change("r1", "$.data.notes.n1", "One"));
+        carol.session.receive(change("r2", "$.data.notes.n2", "Two"));
+
+        // Act
+        clock.now = START + 2 * HOUR;
+        join("alice");
+        const afterToken = authority.requests().map((request) => request.status);
+        clock.now = START + DAY + HOUR;
+        join("alice");
+        const afterEntry = authority.requests().map((request) => request.status);
+        clock.now = START + 2 * DAY + HOUR;
+        join("alice");
+
+        // Assert
+        expect(bob.of("requested")[0]?.request.until).toBe(START + 2 * DAY);
+        expect(carol.of("requested")[0]?.request.until).toBe(START + DAY);
+        expect(afterToken).toEqual(["pending", "pending"]);
+        expect(afterEntry).toEqual(["pending", "expired"]);
+        expect(authority.requests().map((request) => request.status)).toEqual(["expired", "expired"]);
+    });
+
     it("should refuse a request past the most of one requester with unsaved", async () => {
         // Arrange
         const { alice, join } = await setup({ requests: { perRequester: 2 } });

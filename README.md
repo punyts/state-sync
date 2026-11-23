@@ -267,6 +267,10 @@ A grant (`signGrant`, `verifyGrant`, `checkAccess`) lets its subject read or wri
 owner's tree (docs/design/statenet-permissions.md, "Tokens"). Its claims are `entry` (the permission entry it was
 made from), `kid`, `issuer`, `subject`, `owner`, `pattern` (`$`, `$.apps.a1`, `$.apps.*.files`), `rights`
 (`read`, `write`, `request`), `issued`, `expires` and the `parent` it was passed on from, signed with Ed25519.
+Two optional claims set how long a request made with it waits (docs/design/statenet-requests.md, R3c): `requestMs`
+(at most `MAX_REQUEST_MS`, 30 days) and `lasts`, when the entry ends (the token's expiry when absent). Over a chain
+the smallest of each holds, and the authority ends a request at `min(at + requestMs, lasts)`, so a request outlives a
+short-lived token.
 
 - A namespace's path is placed in its owner's tree by its address: `addressPath("alice/apps/a1", "$.files")` is
   `$.apps.a1.files` of `alice`. The owner needs no grant.

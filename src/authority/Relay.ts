@@ -294,7 +294,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
     /** Whether an access may read a prefix of an address, and on what grants; everyone may without `grants` */
     const readable = (address: string, prefix: string, access: Access | undefined) =>
         options.grants === undefined || (access !== undefined && options.trustedNodes?.(access.subject) === true)
-            ? { ok: true as const, expires: Number.POSITIVE_INFINITY, chain: [] as readonly string[] }
+            ? { ok: true as const, expires: Number.POSITIVE_INFINITY, lasts: Number.POSITIVE_INFINITY, chain: [] as readonly string[] }
             : checkAccess(access, { address, path: prefix, right: "read" }, { keyOf: options.grants.keyOf, now: now(), revoked: (id) => revocations.has(id) });
 
     /** Closes one listener with a reason, and the entry's upstream subscription when it was the last */
