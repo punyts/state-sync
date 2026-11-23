@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { SyncMessage } from "../Messages.js";
 import { createAuthority } from "./Authority.js";
-import { addressCovers, generateGrantKey, RevocationList, signGrant, verifyGrant } from "./Grants.js";
+import { compilePattern, type PathPattern } from "@punyts/state";
+import { addressPath, generateGrantKey, patternReach, readGrant, RevocationList, signGrant, verifyGrant } from "./Grants.js";
 import type { GrantClaims, GrantKey } from "./Grants.js";
 import { createMemoryNamespaceStorage } from "./NamespaceStorage.js";
 import { createAuthorityUpstream, createRelay } from "./Relay.js";
 import type { RelayListener } from "./Relay.js";
 
-const ADDRESS = "alice/notes/user";
+/** Alice's state of her app `notes`: `$.apps.notes` of her tree */
+const ADDRESS = "alice/apps/notes";
 const HOUR = 3_600_000;
 const NOW = 1_800_000_000_000;
 
@@ -23,7 +25,7 @@ const keys = () => {
 };
 
 const root = (privateKey: string, claims: Partial<GrantClaims> = {}) =>
-    signGrant({ kid: "alice-1", issuer: "alice", subject: "bob", address: ADDRESS, prefix: "$.data", rights: ["read", "write"], issued: NOW, expires: NOW + HOUR, ...claims }, privateKey);
+    signGrant({ kid: "alice-1", issuer: "alice", subject: "bob", owner: "alice", pattern: "$.apps.notes.data", rights: ["read", "write"], issued: NOW, expires: NOW + HOUR, ...claims }, privateKey);
 
 const listener = () => {
     const state: { welcomed: boolean; closed?: string } = { welcomed: false };
@@ -32,6 +34,9 @@ const listener = () => {
 };
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** The permission entry a token was made from */
+const entryOf = (token: string): string => readGrant(token)?.entry as string;
 
 const owner = async () => {
     const authority = await createAuthority({ namespace: "alice.notes", storage: createMemoryNamespaceStorage(), initial: { data: { notes: {} } } });
@@ -43,7 +48,7 @@ describe("verifyGrant", () => {
         const { alice, bob, keyOf } = keys();
 
         expect(verifyGrant(root(alice.privateKey), { keyOf, now: NOW })).toMatchObject({ ok: true, grant: { subject: "bob" } });
-        expect(verifyGrant(signGrant({ kid: "bob-1", issuer: "bob", subject: "bob", address: ADDRESS, prefix: "$", rights: ["read"], issued: NOW, expires: NOW + HOUR }, bob.privateKey), { keyOf, now: NOW })).toMatchObject({ ok: false });
+        expect(verifyGrant(signGrant({ kid: "bob-1", issuer: "bob", subject: "bob", owner: "alice", pattern: "$", rights: ["read"], issued: NOW, expires: NOW + HOUR }, bob.privateKey), { keyOf, now: NOW })).toMatchObject({ ok: false });
         expect(verifyGrant(root(bob.privateKey), { keyOf, now: NOW })).toEqual({ ok: false, reason: "the signature does not match" });
         expect(verifyGrant(root(alice.privateKey, { expires: NOW }), { keyOf, now: NOW })).toEqual({ ok: false, reason: "expired" });
     });
@@ -51,16 +56,16 @@ describe("verifyGrant", () => {
     it("should never let a passed-on grant be wider than the one it came from", () => {
         // Arrange
         const { alice, bob, keyOf } = keys();
-        const parent = root(alice.privateKey, { prefix: "$.data.notes", rights: ["read"] });
+        const parent = root(alice.privateKey, { pattern: "$.apps.notes.data.notes", rights: ["read"] });
         const passOn = (claims: Partial<GrantClaims>) =>
-            verifyGrant(signGrant({ kid: "bob-1", issuer: "bob", subject: "carol", address: ADDRESS, prefix: "$.data.notes.n1", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent, ...claims }, bob.privateKey), { keyOf, now: NOW });
+            verifyGrant(signGrant({ kid: "bob-1", issuer: "bob", subject: "carol", owner: "alice", pattern: "$.apps.notes.data.notes.*", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent, ...claims }, bob.privateKey), { keyOf, now: NOW });
 
         // Act and assert
         expect(passOn({})).toMatchObject({ ok: true, chain: [expect.any(String), expect.any(String)] });
-        for (const wider of [{ prefix: "$.data" }, { rights: ["read", "write"] as const }, { expires: NOW + 2 * HOUR }, { address: "alice/other/user" }]) {
+        for (const wider of [{ pattern: "$.apps.notes.data" }, { pattern: "$.apps.*.data.notes" }, { rights: ["read", "write"] as const }, { expires: NOW + 2 * HOUR }, { owner: "bob" }]) {
             expect(passOn(wider), JSON.stringify(wider)).toEqual({ ok: false, reason: "wider than the grant it was passed on from" });
         }
-        expect(verifyGrant(signGrant({ kid: "alice-1", issuer: "alice", subject: "carol", address: ADDRESS, prefix: "$.data.notes", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent }, alice.privateKey), { keyOf, now: NOW })).toEqual({ ok: false, reason: "passed on by someone the grant was not given to" });
+        expect(verifyGrant(signGrant({ kid: "alice-1", issuer: "alice", subject: "carol", owner: "alice", pattern: "$.apps.notes.data.notes", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent }, alice.privateKey), { keyOf, now: NOW })).toEqual({ ok: false, reason: "passed on by someone the grant was not given to" });
     });
 
     it("should keep verifying grants of a rotated key until they expire, and refuse what it signs after", () => {
@@ -79,11 +84,21 @@ describe("verifyGrant", () => {
     });
 });
 
-describe("addressCovers", () => {
-    it("should let a granted address name every app with *, but never every owner", () => {
-        expect(addressCovers("alice/*/user", "alice/notes/user")).toBe(true);
-        expect(addressCovers("alice/*/user", "alice/notes/app")).toBe(false);
-        expect(addressCovers("*/notes/user", "alice/notes/user")).toBe(false);
+describe("addressPath and patternReach", () => {
+    it("should place a namespace's path in its owner's tree, and say how far a pattern reaches there", () => {
+        // Arrange
+        const files = compilePattern("$.apps.*.files") as PathPattern;
+
+        // Act
+        const at = addressPath(ADDRESS, "$.files.f1");
+
+        // Assert
+        expect(at).toEqual({ owner: "alice", path: "$.apps.notes.files.f1" });
+        expect(addressPath(ADDRESS, "$")).toEqual({ owner: "alice", path: "$.apps.notes" });
+        expect(patternReach(files, at.path)).toBe("covers");
+        expect(patternReach(files, "$.apps.notes")).toBe("below");
+        expect(patternReach(files, "$.apps.notes.data")).toBe("none");
+        expect(patternReach(files, "$.data")).toBe("none");
     });
 });
 
@@ -95,7 +110,7 @@ describe("grants at the relay and the owner node", () => {
         const node = await owner();
         const relay = createRelay(node.upstream, { sweep: false, now: () => clock, grants: { keyOf } });
         const revoked = root(alice.privateKey);
-        relay.revoke(JSON.parse(Buffer.from(revoked.split(".")[0] as string, "base64url").toString()).id, NOW + HOUR);
+        relay.revoke(entryOf(revoked), NOW + HOUR);
         const [none, expired, wasRevoked, mine, granted] = [listener(), listener(), listener(), listener(), listener()];
 
         // Act
@@ -109,7 +124,7 @@ describe("grants at the relay and the owner node", () => {
         kept.renew();
 
         // Assert
-        expect(none.state).toEqual({ welcomed: false, closed: "a read of alice/notes/user needs a grant" });
+        expect(none.state).toEqual({ welcomed: false, closed: "a read of alice/apps/notes needs a grant" });
         expect(expired.state).toEqual({ welcomed: false, closed: "expired" });
         expect(wasRevoked.state).toEqual({ welcomed: false, closed: "revoked" });
         expect(mine.state).toEqual({ welcomed: true });
@@ -123,7 +138,7 @@ describe("grants at the relay and the owner node", () => {
         const top = createRelay(node.upstream, { sweep: false, now: () => NOW, grants: { keyOf }, trustedNodes: (subject) => subject === "relay-eu" });
         const below = createRelay(top, { sweep: false, now: () => NOW, grants: { keyOf }, node: "relay-eu" });
         const fromAlice = root(alice.privateKey);
-        const toCarol = signGrant({ kid: "bob-1", issuer: "bob", subject: "carol", address: ADDRESS, prefix: "$.data.notes", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent: fromAlice }, bob.privateKey);
+        const toCarol = signGrant({ kid: "bob-1", issuer: "bob", subject: "carol", owner: "alice", pattern: "$.apps.notes.data.notes", rights: ["read"], issued: NOW, expires: NOW + HOUR, parent: fromAlice }, bob.privateKey);
         const [bobReads, carolReads, aliceReads] = [listener(), listener(), listener()];
         top.subscribe(ADDRESS, "$.data", undefined, bobReads.listener, { subject: "bob", grant: fromAlice });
         below.subscribe(ADDRESS, "$.data.notes", undefined, carolReads.listener, { subject: "carol", grant: toCarol });
@@ -131,7 +146,7 @@ describe("grants at the relay and the owner node", () => {
         await tick();
 
         // Act
-        top.revoke(JSON.parse(Buffer.from(fromAlice.split(".")[0] as string, "base64url").toString()).id, NOW + HOUR);
+        top.revoke(entryOf(fromAlice), NOW + HOUR);
 
         // Assert
         expect(bobReads.state.closed).toBe("revoked");
@@ -140,12 +155,39 @@ describe("grants at the relay and the owner node", () => {
         expect(below.stats()).toEqual({ upstream: 0, listeners: 0 });
     });
 
+    it("should give a reader whose grant reaches below its prefix only what the pattern matches, and refuse such a write", async () => {
+        // Arrange: Bob may read the title of each note, not the rest
+        const { alice, keyOf } = keys();
+        const node = await owner();
+        node.authority.write({ path: "$.data.notes.n1", op: "set", value: { title: "One", body: "secret" } });
+        const relay = createRelay(node.upstream, { sweep: false, now: () => NOW, grants: { keyOf } });
+        const grant = root(alice.privateKey, { pattern: "$.apps.notes.data.notes.*.title", rights: ["read"] });
+        const seen: { welcome?: unknown; changes: unknown[] } = { changes: [] };
+        relay.subscribe(ADDRESS, "$.data", undefined, { welcome: (welcome) => (seen.welcome = "value" in welcome ? welcome.value : undefined), changes: (batch) => seen.changes.push(...batch.changes.map((change) => [change.op, change.path, change.value])) }, { subject: "bob", grant });
+        await tick();
+
+        // Act
+        node.authority.write({ path: "$.data.notes.n1.body", op: "set", value: "more secret" });
+        node.authority.write({ path: "$.data.notes.n2", op: "set", value: { title: "Two", body: "hidden" } });
+        node.authority.write({ path: "$.data.notes", op: "merge", value: { n3: { title: "Three", body: "hidden" }, n4: "plain" } });
+        node.authority.write({ path: "$.data.notes.n1.title", op: "set", value: "First" });
+        await tick();
+
+        // Assert
+        expect(seen.welcome).toEqual({ notes: { n1: { title: "One" } } });
+        expect(seen.changes).toEqual([
+            ["set", "$.data.notes.n2", { title: "Two" }],
+            ["merge", "$.data.notes", { n3: { title: "Three" }, n4: {} }],
+            ["set", "$.data.notes.n1.title", "First"]
+        ]);
+    });
+
     it("should refuse a write with a revoked grant at the owner node at once, and take one with a grant that covers it", async () => {
         // Arrange
         const { alice, keyOf } = keys();
         const revocations = new RevocationList();
         const authority = await createAuthority({ namespace: "alice.notes", storage: createMemoryNamespaceStorage(), initial: { data: { notes: {} } }, access: { address: ADDRESS, context: () => ({ keyOf, now: NOW, revoked: (id) => revocations.has(id) }) } });
-        const grant = root(alice.privateKey, { prefix: "$.data.notes" });
+        const grant = root(alice.privateKey, { pattern: "$.apps.notes.data.notes" });
         const received: SyncMessage[] = [];
         const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, { subject: "bob", grant });
         session.receive(JSON.stringify({ type: "hello", namespace: "alice.notes", revision: 0, clientId: "b", protocol: 2 }));
@@ -154,14 +196,14 @@ describe("grants at the relay and the owner node", () => {
         // Act
         change("c1", "$.data.notes.n1");
         change("c2", "$.data.other");
-        revocations.add(JSON.parse(Buffer.from(grant.split(".")[0] as string, "base64url").toString()).id, NOW + HOUR);
+        revocations.add(entryOf(grant), NOW + HOUR);
         change("c3", "$.data.notes.n2");
 
         // Assert
         const acks = received.filter((message) => message.type === "ack");
         expect(acks).toEqual([
             { type: "ack", id: "c1", result: "applied", revision: 1 },
-            { type: "ack", id: "c2", result: "rejected", reason: "the grant does not let bob write $.data.other of alice/notes/user", code: "access" },
+            { type: "ack", id: "c2", result: "rejected", reason: "the grant does not let bob write $.data.other of alice/apps/notes", code: "access" },
             { type: "ack", id: "c3", result: "rejected", reason: "revoked", code: "access" }
         ]);
     });

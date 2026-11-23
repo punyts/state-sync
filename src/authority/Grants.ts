@@ -1,25 +1,28 @@
 import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
 import type { KeyObject } from "node:crypto";
+import { compilePattern, pathSteps, patternContains, patternCovers, stepAdmits, type PathPattern } from "@punyts/state";
 
-/** What a grant lets its subject do under its prefix */
+/** What a grant lets its subject do under its pattern */
 export type GrantRight = "read" | "write";
 
 /**
- * A right to read or write paths at an address (docs/design/statenet-relays.md, "Grants"), signed by its issuer's
- * key. A grant the owner of the address issues is a root; one a subject passes on embeds the grant it came from as
- * `parent`, and may only narrow it
+ * A right to read or write the paths a pattern covers under one owner (docs/design/statenet-permissions.md, "Tokens"),
+ * signed by its issuer's key. It is made from a permission entry and names it, so revoking the entry ends it. A grant
+ * the owner issues is a root; one a subject passes on embeds the grant it came from as `parent`, and may only narrow it
  */
 export interface GrantClaims {
-    readonly id: string;
+    /** The permission entry it was made from: what a revocation names */
+    readonly entry: string;
     /** The id of the key that signed it */
     readonly kid: string;
-    /** Who gave it: the owner of the address for a root, the subject of `parent` for one passed on */
+    /** Who gave it: the owner for a root, the subject of `parent` for one passed on */
     readonly issuer: string;
-    /** Who may use it: a user, an app or a node */
+    /** Who may use it: a person, an org or a node */
     readonly subject: string;
-    readonly address: string;
-    /** The "$."-prefixed path it covers, and everything below */
-    readonly prefix: string;
+    /** The owner whose tree it is in: the `$` of its pattern */
+    readonly owner: string;
+    /** The path pattern it covers, with everything below each match: `$`, `$.apps.a1`, `$.apps.*.files`, `$.data.{set}` */
+    readonly pattern: string;
     readonly rights: readonly GrantRight[];
     /** When it was signed and when it stops working, in milliseconds since the epoch */
     readonly issued: number;
@@ -41,8 +44,8 @@ export interface GrantContext {
     /** The public key of a key id; undefined when there is none */
     readonly keyOf: (kid: string) => GrantKey | undefined;
     readonly now: number;
-    /** Whether a grant id was revoked */
-    readonly revoked?: (grantId: string) => boolean;
+    /** Whether an entry was revoked */
+    readonly revoked?: (entry: string) => boolean;
 }
 
 export type GrantCheck =
@@ -54,26 +57,33 @@ export const MAX_GRANT_DEPTH = 8;
 
 const encode = (bytes: Uint8Array | string): string => Buffer.from(bytes).toString("base64url");
 const decode = (text: string): Buffer => Buffer.from(text, "base64url");
-const segmentsOf = (path: string): string[] => (path === "$" ? [] : path.slice(2).split("."));
 
 /** The owner of an address: its first segment */
 export const ownerOfAddress = (address: string): string => address.split("/")[0] ?? "";
 
 /**
- * True when a granted address covers an address: the same, or with `*` for a segment after the owner (an org's
- * standing read of a member's state names every app as `*`)
+ * Where a path of a namespace is in its owner's tree: the address's segments after the owner lead to the namespace, so
+ * `$.notes` of `alice/apps/a1` is `$.apps.a1.notes` of `alice`
  */
-export const addressCovers = (granted: string, address: string): boolean => {
-    const outer = granted.split("/");
-    const inner = address.split("/");
-    return outer.length === inner.length && outer.every((segment, index) => segment === inner[index] || (index > 0 && segment === "*"));
+export const addressPath = (address: string, path: string): { readonly owner: string; readonly path: string } => {
+    const [owner = "", ...base] = address.split("/");
+    const steps = [...base, ...pathSteps(path)];
+    return { owner, path: steps.length === 0 ? "$" : `$.${steps.join(".")}` };
 };
 
-/** True when a path is at or below a prefix */
-export const isWithinPrefix = (prefix: string, path: string): boolean => {
-    const outer = segmentsOf(prefix);
-    const inner = segmentsOf(path);
-    return outer.length <= inner.length && outer.every((segment, index) => segment === inner[index]);
+/** A grant's pattern read: `$` is the whole tree; undefined when it is not a pattern */
+export const grantPattern = (source: string): PathPattern | undefined => (source === "$" ? { source, steps: [] } : compilePattern(source));
+
+/**
+ * How far a pattern reaches at a path: `covers` when the path is at or below one of its matches, `below` when the path
+ * is above a match (a read of it gets only what the pattern matches), `none` when it is beside every match
+ */
+export const patternReach = (pattern: PathPattern, path: string): "covers" | "below" | "none" => {
+    if (patternCovers(pattern, path)) {
+        return "covers";
+    }
+    const steps = pathSteps(path);
+    return steps.length < pattern.steps.length && steps.every((step, index) => stepAdmits(pattern.steps[index] as PathPattern["steps"][number], step)) ? "below" : "none";
 };
 
 /** A new signing key: its private part (PKCS#8 DER) and its public part (SPKI DER), both base64url */
@@ -89,8 +99,8 @@ const privateKeyOf = (key: string | KeyObject): KeyObject => (typeof key === "st
 const publicKeyOf = (key: string): KeyObject => createPublicKey({ key: decode(key), format: "der", type: "spki" });
 
 /** Signs a grant's claims with a private key; the token is the claims and the signature, each base64url */
-export const signGrant = (claims: Omit<GrantClaims, "id"> & { id?: string }, privateKey: string | KeyObject): string => {
-    const full: GrantClaims = { ...claims, id: claims.id ?? randomUUID() };
+export const signGrant = (claims: Omit<GrantClaims, "entry"> & { entry?: string }, privateKey: string | KeyObject): string => {
+    const full: GrantClaims = { ...claims, entry: claims.entry ?? randomUUID() };
     const body = encode(JSON.stringify(full));
     return `${body}.${encode(sign(null, Buffer.from(body), privateKeyOf(privateKey)))}`;
 };
@@ -100,7 +110,7 @@ export const readGrant = (token: string): GrantClaims | undefined => {
     const [body] = token.split(".");
     try {
         const claims = JSON.parse(decode(body ?? "").toString("utf8")) as GrantClaims;
-        return typeof claims === "object" && claims !== null && typeof claims.id === "string" ? claims : undefined;
+        return typeof claims === "object" && claims !== null && typeof claims.entry === "string" && typeof claims.owner === "string" && typeof claims.pattern === "string" ? claims : undefined;
     }
     catch {
         return undefined;
@@ -109,9 +119,9 @@ export const readGrant = (token: string): GrantClaims | undefined => {
 
 /**
  * Checks a grant and the chain it came from: every signature by its issuer's key (a key retired before a grant was
- * issued does not count), the root issued by the owner of the address, each grant passed on by the subject of the
- * one before and no wider than it (the same address, a prefix within, rights among, an expiry no later), nothing
- * expired, nothing in the chain revoked. Answers the grant with the ids of its chain, root last
+ * issued does not count), the root issued by the owner, each grant passed on by the subject of the one before and no
+ * wider than it (the same owner, a pattern it contains, rights among, an expiry no later), nothing expired, no entry
+ * in the chain revoked. Answers the grant with the entries of its chain, root last
  */
 export const verifyGrant = (token: string, context: GrantContext, depth = 0): GrantCheck => {
     if (depth >= MAX_GRANT_DEPTH) {
@@ -121,6 +131,10 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
     const claims = readGrant(token);
     if (body === undefined || signature === undefined || rest !== undefined || claims === undefined) {
         return { ok: false, reason: "not a grant" };
+    }
+    const pattern = grantPattern(claims.pattern);
+    if (pattern === undefined) {
+        return { ok: false, reason: "not a pattern" };
     }
     const key = context.keyOf(claims.kid);
     if (key === undefined) {
@@ -145,14 +159,14 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
     if (claims.expires <= context.now) {
         return { ok: false, reason: "expired" };
     }
-    if (context.revoked?.(claims.id) === true) {
+    if (context.revoked?.(claims.entry) === true) {
         return { ok: false, reason: "revoked" };
     }
     if (claims.parent === undefined) {
-        if (claims.issuer !== ownerOfAddress(claims.address)) {
-            return { ok: false, reason: "a grant must come from the owner of the address, or be passed on from one that does" };
+        if (claims.issuer !== claims.owner) {
+            return { ok: false, reason: "a grant must come from the owner, or be passed on from one that does" };
         }
-        return { ok: true, grant: claims, chain: [claims.id] };
+        return { ok: true, grant: claims, chain: [claims.entry] };
     }
     const parent = verifyGrant(claims.parent, context, depth + 1);
     if (!parent.ok) {
@@ -162,15 +176,11 @@ export const verifyGrant = (token: string, context: GrantContext, depth = 0): Gr
     if (from.subject !== claims.issuer) {
         return { ok: false, reason: "passed on by someone the grant was not given to" };
     }
-    if (!addressCovers(from.address, claims.address) || !isWithinPrefix(from.prefix, claims.prefix) || !claims.rights.every((right) => from.rights.includes(right)) || claims.expires > from.expires) {
+    if (from.owner !== claims.owner || !patternContains(grantPattern(from.pattern) as PathPattern, pattern) || !claims.rights.every((right) => from.rights.includes(right)) || claims.expires > from.expires) {
         return { ok: false, reason: "wider than the grant it was passed on from" };
     }
-    return { ok: true, grant: claims, chain: [claims.id, ...parent.chain] };
+    return { ok: true, grant: claims, chain: [claims.entry, ...parent.chain] };
 };
-
-/** Whether a checked grant lets a subject use a right at a path of an address */
-export const grantAllows = (grant: GrantClaims, need: { readonly subject: string; readonly address: string; readonly path: string; readonly right: GrantRight }): boolean =>
-    grant.subject === need.subject && addressCovers(grant.address, need.address) && grant.rights.includes(need.right) && isWithinPrefix(grant.prefix, need.path);
 
 /** Who is asking, and the grant they present: the owner of an address needs none for it */
 export interface Access {
@@ -178,12 +188,28 @@ export interface Access {
     readonly grant?: string;
 }
 
+/** What `checkAccess` answers when the right holds */
+export interface AccessAllowed {
+    readonly ok: true;
+    /** When the right lapses: the grant's expiry; Infinity for the owner */
+    readonly expires: number;
+    /** The entries the right rests on */
+    readonly chain: readonly string[];
+    /**
+     * A read of a path above the grant's matches: the grant's pattern, in the owner's tree, which cuts what the reader
+     * gets to the parts it matches (`cutTo`)
+     */
+    readonly cut?: PathPattern;
+}
+
 /**
- * Whether an access may use a right at a path of an address: the owner always, anyone else with a grant that checks
- * and allows it. Answers when the right lapses (the grant's expiry; Infinity for the owner) and the grant ids it rests on
+ * Whether an access may use a right at a path of an address: the owner always, anyone else with a grant that checks,
+ * is theirs, is for the address's owner, has the right, and whose pattern covers the path. A read of a path above the
+ * pattern's matches is allowed too, cut to what the pattern matches; a write never is
  */
-export const checkAccess = (access: Access | undefined, need: { readonly address: string; readonly path: string; readonly right: GrantRight }, context: GrantContext): { ok: true; expires: number; chain: readonly string[] } | { ok: false; reason: string } => {
-    if (access !== undefined && access.subject === ownerOfAddress(need.address)) {
+export const checkAccess = (access: Access | undefined, need: { readonly address: string; readonly path: string; readonly right: GrantRight }, context: GrantContext): AccessAllowed | { readonly ok: false; readonly reason: string } => {
+    const at = addressPath(need.address, need.path);
+    if (access !== undefined && access.subject === at.owner) {
         return { ok: true, expires: Number.POSITIVE_INFINITY, chain: [] };
     }
     if (access?.grant === undefined) {
@@ -193,29 +219,31 @@ export const checkAccess = (access: Access | undefined, need: { readonly address
     if (!checked.ok) {
         return checked;
     }
-    if (!grantAllows(checked.grant, { subject: access.subject, ...need })) {
+    const { grant } = checked;
+    const reach = grant.subject === access.subject && grant.owner === at.owner && grant.rights.includes(need.right) ? patternReach(grantPattern(grant.pattern) as PathPattern, at.path) : "none";
+    if (reach === "none" || (reach === "below" && need.right !== "read")) {
         return { ok: false, reason: `the grant does not let ${access.subject} ${need.right} ${need.path} of ${need.address}` };
     }
-    return { ok: true, expires: checked.grant.expires, chain: checked.chain };
+    return { ok: true, expires: grant.expires, chain: checked.chain, ...(reach === "below" ? { cut: grantPattern(grant.pattern) as PathPattern } : {}) };
 };
 
-/** Revoked grant ids, each kept until the grant would have expired */
+/** Revoked entries, each kept until the grants made from it would have expired */
 export class RevocationList {
     private readonly revoked = new Map<string, number>();
 
-    add(grantId: string, expires: number): void {
-        this.revoked.set(grantId, Math.max(expires, this.revoked.get(grantId) ?? 0));
+    add(entry: string, expires: number): void {
+        this.revoked.set(entry, Math.max(expires, this.revoked.get(entry) ?? 0));
     }
 
-    has(grantId: string): boolean {
-        return this.revoked.has(grantId);
+    has(entry: string): boolean {
+        return this.revoked.has(entry);
     }
 
-    /** Forgets the ids whose grants have expired by now */
+    /** Forgets the entries whose grants have expired by now */
     prune(now: number): void {
-        for (const [id, expires] of this.revoked) {
+        for (const [entry, expires] of this.revoked) {
             if (expires <= now) {
-                this.revoked.delete(id);
+                this.revoked.delete(entry);
             }
         }
     }

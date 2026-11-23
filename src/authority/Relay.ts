@@ -3,6 +3,7 @@ import { copyJson } from "../Apply.js";
 import type { JsonValue, RevisedChange } from "../Change.js";
 import { SERVER_PATH, isAtOrBelow } from "../Paths.js";
 import type { Authority } from "./Authority.js";
+import { cutTo, type Cut } from "./Cut.js";
 import { checkAccess, RevocationList, type Access, type GrantKey } from "./Grants.js";
 
 /**
@@ -32,8 +33,8 @@ export interface RelayListener {
     durable?(revision: number): void;
     /** The subscription ended: its lease ran out, its grant was refused or revoked, or the address has no namespace */
     closed?(reason: string): void;
-    /** A grant was revoked: passed down every subscription, so relays below drop the listeners that used it */
-    revoked?(grantId: string, expires: number): void;
+    /** A permission entry was revoked: passed down every subscription, so relays below drop the listeners that used it */
+    revoked?(entry: string, expires: number): void;
 }
 
 export interface RelaySubscription {
@@ -210,7 +211,8 @@ export interface RelayOptions {
     sweep?: boolean;
     /**
      * Checks every subscription's read access on subscribe and on each renewal (the owner of an address reads freely,
-     * anyone else with a read grant for the prefix): the public keys by id. Without it every subscription is served
+     * anyone else with a read grant whose pattern covers the prefix, or reaches below it and cuts what the listener
+     * gets): the public keys by id. Without it every subscription is served
      */
     grants?: { keyOf: (kid: string) => GrantKey | undefined };
     /** This relay's node id, which it presents upstream: the relay above trusts it rather than asking for grants */
@@ -222,9 +224,11 @@ export interface RelayOptions {
 interface Listening {
     readonly listener: RelayListener;
     readonly access?: Access;
-    /** The grant ids its read rests on, and when that read lapses */
+    /** The entries its read rests on, and when that read lapses */
     chain: readonly string[];
     readEnds: number;
+    /** What it gets of the prefix when its grant reaches only part of it */
+    cut?: Cut;
     /** The revision this listener has: what its next batch must follow */
     revision: number;
     expires: number;
@@ -261,11 +265,11 @@ export interface Relay extends Upstream {
     /** Drops the listeners whose lease or read ran out, and the upstream subscriptions only they needed */
     sweep: () => void;
     /**
-     * Revokes a grant here and below: the listeners whose read rests on it (or on a grant it was passed on from) are
-     * closed, every listener is told so relays below do the same, and the id is kept until `expires`, so a renewal or
-     * a new subscription with it fails
+     * Revokes a permission entry here and below: the listeners whose read rests on it (or on an entry it was passed on
+     * from) are closed, every listener is told so relays below do the same, and the entry is kept until `expires`, so a
+     * renewal or a new subscription with a grant made from it fails
      */
-    revoke: (grantId: string, expires: number) => void;
+    revoke: (entry: string, expires: number) => void;
     stats: () => RelayStats;
     /** Closes every subscription, upstream and below */
     close: () => void;
@@ -303,20 +307,24 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
         }
     };
 
-    const revoke = (grantId: string, expires: number) => {
-        report(CATEGORY, "Grant %s was revoked", [grantId]);
-        revocations.add(grantId, expires);
+    const revoke = (revokedEntry: string, expires: number) => {
+        report(CATEGORY, "Entry %s was revoked", [revokedEntry]);
+        revocations.add(revokedEntry, expires);
         for (const entry of [...entries.values()]) {
             for (const listening of [...entry.listeners]) {
-                if (listening.chain.includes(grantId)) {
+                if (listening.chain.includes(revokedEntry)) {
                     remove(entry, listening, "revoked");
                 }
                 else {
-                    listening.listener.revoked?.(grantId, expires);
+                    listening.listener.revoked?.(revokedEntry, expires);
                 }
             }
         }
     };
+
+    /** The changes a listener gets of a batch: all of them, or its cut of them */
+    const cutChanges = (listening: Listening, changes: readonly RevisedChange[]): RevisedChange[] =>
+        listening.cut === undefined ? [...changes] : changes.flatMap((change) => listening.cut?.change(change) ?? []);
 
     const keyOf = (address: string, prefix: string) => `${address}\n${prefix}`;
 
@@ -326,10 +334,11 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             listening.listener.welcome({ revision: entry.revision, previous: from, changes: [], ...durable });
         }
         else if (from > 0 && from >= entry.logFrom && from < entry.revision) {
-            listening.listener.welcome({ revision: entry.revision, previous: from, changes: copyJson(entry.log.filter((change) => change.revision > from)), ...durable });
+            listening.listener.welcome({ revision: entry.revision, previous: from, changes: copyJson(cutChanges(listening, entry.log.filter((change) => change.revision > from))), ...durable });
         }
         else {
-            const value = dig(entry.root, segmentsOf(entry.prefix));
+            const whole = dig(entry.root, segmentsOf(entry.prefix));
+            const value = listening.cut === undefined ? whole : listening.cut.value(entry.prefix, whole);
             listening.listener.welcome({ revision: entry.revision, value: value === undefined ? undefined : copyJson(value), ...durable });
         }
         listening.revision = entry.revision;
@@ -387,7 +396,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             },
             changes: (batch) => accept(entry, batch, false),
             durable: (revision) => durableOf(entry, revision),
-            revoked: (grantId, expires) => revoke(grantId, expires),
+            revoked: (revokedEntry, expires) => revoke(revokedEntry, expires),
             closed: (reason) => {
                 report(CATEGORY, "Upstream closed %s %s: %s, %s listeners", [entry.address, entry.prefix, reason, entry.listeners.size]);
                 for (const listening of entry.listeners) {
@@ -443,7 +452,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             if (listening.waiting !== undefined) {
                 continue;
             }
-            listening.listener.changes({ previous: listening.revision, revision: entry.revision, changes: copyJson(fresh.filter((change) => change.revision > listening.revision)) });
+            listening.listener.changes({ previous: listening.revision, revision: entry.revision, changes: copyJson(cutChanges(listening, fresh.filter((change) => change.revision > listening.revision))) });
             listening.revision = entry.revision;
         }
     };
@@ -506,7 +515,7 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
             }
             const key = keyOf(address, prefix);
             let entry = entries.get(key);
-            const listening: Listening = { listener, revision, expires: now() + leaseMs, chain: allowed.chain, readEnds: allowed.expires, ...(access === undefined ? {} : { access }) };
+            const listening: Listening = { listener, revision, expires: now() + leaseMs, chain: allowed.chain, readEnds: allowed.expires, ...(access === undefined ? {} : { access }), ...(allowed.cut === undefined ? {} : { cut: cutTo(address, allowed.cut) }) };
             if (entry === undefined) {
                 entry = { address, prefix, upstream: undefined, ready: false, revision: 0, durable: 0, epoch: 0, root: {}, log: [], logFrom: 0, listeners: new Set() };
                 entries.set(key, entry);
@@ -555,6 +564,12 @@ export const createRelay = (upstream: Upstream, options: RelayOptions = {}): Rel
                 }
                 listening.chain = allowed.chain;
                 listening.readEnds = allowed.expires;
+                if (allowed.cut === undefined) {
+                    delete listening.cut;
+                }
+                else {
+                    listening.cut = cutTo(entry.address, allowed.cut);
+                }
                 listening.expires = now() + leaseMs;
             },
             close: () => {

@@ -7,8 +7,8 @@ import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
-import { isWithinPattern, touchesPattern } from "./Patterns.js";
-import { checkAccess, type Access, type GrantContext } from "./Grants.js";
+import { mayTouch, pathSteps, patternCovers, type PathPattern } from "@punyts/state";
+import { checkAccess, grantPattern, type Access, type GrantContext } from "./Grants.js";
 import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
@@ -170,8 +170,17 @@ interface Session {
     access?: Access;
 }
 
+/** A path pattern of an authority's options or handlers (`$`, `$.presence.*`), read by @punyts/state's matcher */
+const patternOf = (source: string): PathPattern => {
+    const pattern = grantPattern(source);
+    if (pattern === undefined) {
+        throw new Error(`${source} is not a path pattern`);
+    }
+    return pattern;
+};
+
 interface RegisteredHandler {
-    pattern: string;
+    pattern: PathPattern;
     handler: ChangeHandler;
 }
 
@@ -250,8 +259,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     /** The changes to be saved that no landed save holds yet, and whether writes are refused for them */
     let unsaved = 0;
     let refusing = false;
-    const ephemeral = options.ephemeral ?? [];
-    const isEphemeral = (path: string) => ephemeral.some((pattern) => isWithinPattern(pattern, path));
+    const ephemeral = (options.ephemeral ?? []).map(patternOf);
+    const isEphemeral = (path: string) => ephemeral.some((pattern) => patternCovers(pattern, path));
     //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
     let durableRevision = revision;
     const durableListeners = new Set<(revision: number) => void>();
@@ -283,12 +292,12 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
 
     /** Removes the values at the paths an ephemeral pattern matches from a copy of the state */
     const stripEphemeral = (state: { [key: string]: JsonValue }) => {
-        const strip = (node: JsonValue | undefined, segments: readonly string[]): void => {
+        const strip = (node: JsonValue | undefined, segments: PathPattern["steps"]): void => {
             if (node === null || typeof node !== "object" || Array.isArray(node) || segments.length === 0) {
                 return;
             }
-            const [first, ...rest] = segments as [string, ...string[]];
-            for (const key of first === "*" ? Object.keys(node) : [first]) {
+            const [first, ...rest] = segments as [PathPattern["steps"][number], ...PathPattern["steps"]];
+            for (const key of first.kind === "literal" ? [first.text] : Object.keys(node)) {
                 if (rest.length === 0) {
                     delete node[key];
                 }
@@ -298,7 +307,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             }
         };
         for (const pattern of ephemeral) {
-            strip(state, pattern.split(".").slice(1));
+            strip(state, pattern.steps);
         }
     };
 
@@ -520,7 +529,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const stale = received.base < revision - log.length ||
             since.some((logged) => isAtOrBelow(logged.path, received.path) || isAtOrBelow(received.path, logged.path));
         for (const { pattern, handler } of [...handlers]) {
-            if (!touchesPattern(pattern, received.path)) {
+            if (!mayTouch(pattern, pathSteps(received.path))) {
                 continue;
             }
             let verdict: ChangeVerdict;
@@ -681,7 +690,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             };
         },
         onChange: (pattern, handler) => {
-            const registered: RegisteredHandler = { pattern, handler };
+            const registered: RegisteredHandler = { pattern: patternOf(pattern), handler };
             handlers.push(registered);
             return () => {
                 const index = handlers.indexOf(registered);

@@ -235,6 +235,24 @@ authority.emit("notice", { text: "saved" });
   server write under it is applied and saved but takes no revision, so it is never logged, pushed or in a `welcome`,
   and clients see no revision gap. Snapshots leave it out.
 
+### Grants
+
+A grant (`signGrant`, `verifyGrant`, `checkAccess`) lets its subject read or write the paths a pattern covers in one
+owner's tree (docs/design/statenet-permissions.md, "Tokens"). Its claims are `entry` (the permission entry it was
+made from), `kid`, `issuer`, `subject`, `owner`, `pattern` (`$`, `$.apps.a1`, `$.apps.*.files`), `rights`
+(`read`, `write`), `issued`, `expires` and the `parent` it was passed on from, signed with Ed25519.
+
+- A namespace's path is placed in its owner's tree by its address: `addressPath("alice/apps/a1", "$.files")` is
+  `$.apps.a1.files` of `alice`. The owner needs no grant.
+- A root is issued by the owner; a grant passed on is checked up the chain, never wider than its parent (the same owner,
+  a pattern its parent's contains, fewer rights, no later expiry). A revoked entry anywhere in the chain fails it.
+- `checkAccess` allows a path the pattern covers. A read of a path above the pattern's matches is allowed and answers
+  `cut`: a relay then gives that listener only what the pattern matches (`cutTo`), in its snapshot and in every
+  change. A write needs a pattern that covers the path.
+- `Relay.revoke(entry, expires)` closes the listeners whose read rests on the entry and tells every other listener, so
+  relays below do the same.
+- Change handlers and `ephemeral` paths are patterns of `@punyts/state` too.
+
 ### `$.server` at rest
 
 ```ts
