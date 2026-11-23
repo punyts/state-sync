@@ -241,12 +241,15 @@ const checkNamespace = (value: unknown, limits: SyncLimits) => {
 const checkMessage = (message: Shape, limits: SyncLimits) => {
     switch (message.type) {
         case "hello":
-            checkKeys(message, "hello", ["type", "namespace", "revision", "clientId", "protocol"]);
+            checkKeys(message, "hello", ["type", "namespace", "revision", "clientId", "protocol"], ["requests"]);
             checkNamespace(message.namespace, limits);
             checkRevision(message.revision, "revision");
             checkString(message.clientId, "clientId", limits.maxIdLength);
             if (!PROTOCOL_VERSIONS.includes(message.protocol as number)) {
                 fail(`protocol must be one of ${PROTOCOL_VERSIONS.join(", ")}`);
+            }
+            if ("requests" in message && (message.requests !== true || (message.protocol as number) < 3)) {
+                fail("requests must be true, with protocol 3");
             }
             return;
         case "welcome":

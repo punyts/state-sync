@@ -43,7 +43,7 @@ interface RevisedChange extends Change { revision: number }   // accepted by the
 
 | type | sent by | fields |
 |---|---|---|
-| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (`PROTOCOL_VERSION`, 3; an authority speaks 1 to 3) |
+| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (`PROTOCOL_VERSION`, 3; an authority speaks 1 to 3); protocol 3 may add `requests: true`: the welcome carries the requests and no state, and the session gets `requested` and `decided` only |
 | `welcome` | authority | `namespace`, `revision`, and exactly one of `changes` (since the client's revision) or `snapshot`; protocol 2 adds `durable`, protocol 3 `requests` |
 | `changes` | authority | `changes`: revised changes from other clients or server logic |
 | `change` | client | `change` |

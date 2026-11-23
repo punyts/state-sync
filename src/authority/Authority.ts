@@ -210,6 +210,8 @@ interface Session {
     clientId: string;
     /** The protocol of its hello: 2 gets the durable watermark */
     protocol: number;
+    /** Its hello asked for requests only: no changes and no watermark */
+    requestsOnly?: boolean;
     /** Who the connection is and the grant it presents, for `AuthorityOptions.access` */
     access?: Access;
     /** Takes the session's acks in place of its connection (`submit`) */
@@ -331,7 +333,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         durableRevision = to;
         for (const session of sessions) {
-            if (session.welcomed && session.protocol >= 2) {
+            if (session.welcomed && session.protocol >= 2 && session.requestsOnly !== true) {
                 send(session, { type: "durable", revision: to });
             }
         }
@@ -483,9 +485,16 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const changes = log.slice(log.length - missing);
         session.clientId = hello.clientId;
         session.protocol = hello.protocol;
+        session.requestsOnly = hello.requests === true;
         sweep();
         const context = options.access?.context();
         const asked = hello.protocol >= 3 ? { requests: [...requests.values()].filter((request) => sees(session, request, context)).map((request) => syncRequest(request, session)) } : {};
+        if (session.requestsOnly) {
+            send(session, { type: "welcome", namespace, revision, changes: [], ...asked });
+            session.welcomed = true;
+            report(CATEGORY, "Welcomed client %s to the requests of %s", [hello.clientId, namespace]);
+            return;
+        }
         send(session, logged
             ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable, ...asked }
             : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable, ...asked });
@@ -692,7 +701,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             listener(copyJson<RevisedChange[]>(changes));
         }
         for (const other of sessions) {
-            if (other !== writer && other.welcomed) {
+            if (other !== writer && other.welcomed && other.requestsOnly !== true) {
                 send(other, { type: "changes", changes: other.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change) });
             }
         }

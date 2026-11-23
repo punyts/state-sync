@@ -19,6 +19,12 @@ export interface HelloMessage {
     revision: number;
     clientId: string;
     protocol: number;
+    /**
+     * Protocol 3: the session follows requests only: its welcome carries the requests and no changes, and it gets
+     * `requested` and `decided` but no `changes` or `durable`. A relay that serves a namespace's state from its
+     * cache opens one to the owner for a browser's requests
+     */
+    requests?: true;
 }
 
 /**

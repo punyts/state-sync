@@ -55,6 +55,26 @@ const setup = async (options: Partial<AuthorityOptions> = {}, storage: Namespace
 };
 
 describe("requests", () => {
+    it("should welcome a session that asked for requests only with its requests, and send it no changes or watermark", async () => {
+        // Arrange: bob asked for a change; the owner writes another
+        const { authority, alice, join } = await setup();
+        const bob = join("bob", grantOf(alice.privateKey, ["read", "request"]));
+        bob.session.receive(change("r1", "$.data.notes.n1", "Hello"));
+        const received: SyncMessage[] = [];
+        const tunnel = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, { subject: "bob", grant: grantOf(alice.privateKey, ["read", "request"]) });
+
+        // Act
+        tunnel.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "relay-1", protocol: 3, requests: true }));
+        authority.write({ path: "$.data.notes.n2", op: "set", value: "Owner" });
+        await authority.flush();
+        bob.session.receive(JSON.stringify({ type: "withdraw", id: "r1" }));
+
+        // Assert
+        expect(received.map((message) => message.type)).toEqual(["welcome", "decided"]);
+        expect(received[0]).toMatchObject({ type: "welcome", changes: [], requests: [{ id: "r1", mine: true, status: "pending" }] });
+        expect(received[0]).not.toHaveProperty("snapshot");
+    });
+
     it("should keep a change from someone who may only request it as a request, told to its requester and the owner", async () => {
         // Arrange
         const { authority, alice, join } = await setup();

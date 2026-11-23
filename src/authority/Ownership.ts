@@ -272,7 +272,8 @@ function plainHost(storage: EpochStorage, initial: (address: string) => { [key: 
             let found = running.get(address);
             if (found === undefined) {
                 found = createAuthority({
-                    namespace: address.replace(/[^A-Za-z0-9_-]+/g, "_"),
+                    //the sync name of an address, as every client of it says hello: '/' becomes '.'
+                    namespace: address.split("/").map((segment) => segment.replace(/[^A-Za-z0-9_-]+/g, "_")).join("."),
                     storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) },
                     initial: initial(address),
                     createParents: true,
