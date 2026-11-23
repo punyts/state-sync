@@ -102,7 +102,7 @@ describe("parseMessage", () => {
 
     describe("hello", () => {
         it("should refuse another protocol version", () => {
-            expect(refusal({ ...VALID.hello, protocol: 3 }).message).toContain("protocol");
+            expect(refusal({ ...VALID.hello, protocol: 4 }).message).toContain("protocol");
         });
 
         it("should refuse a bad namespace", () => {

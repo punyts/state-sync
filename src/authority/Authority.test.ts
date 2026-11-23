@@ -132,7 +132,7 @@ describe("createAuthority", () => {
             const { join } = await setup();
             const old = join();
 
-            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 3 }));
+            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 4 }));
             old.session.receive(change("$.data.total", 1));
 
             expect(old.received.map((message) => message.type === "error" && message.code)).toEqual(["invalid-message", "no-hello"]);

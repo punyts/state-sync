@@ -9,8 +9,10 @@ import {
     REVOKED_CODE,
     type AckMessage,
     type ChangesMessage,
+    type DecidedMessage,
     type RejectionCode,
     type SyncMessage,
+    type SyncRequest,
     type WelcomeMessage
 } from "./Messages.js";
 import { SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
@@ -65,6 +67,11 @@ export interface SyncClientOptions {
     onStatus?: (report: SyncStatusReport) => void;
     /** The authority refused a change; its path shows the confirmed value again */
     onRejected?: (rejection: SyncRejection) => void;
+    /**
+     * The requests the client knows changed (protocol 3, docs/design/statenet-requests.md): its own, sent by changes the
+     * authority keeps for a decision, and those it may decide; each as it is now, the decided ones too
+     */
+    onRequests?: (requests: readonly SyncRequest[]) => void;
     onEmit?: (name: string, value?: JsonValue) => void;
     /** The durable watermark moved (protocol 2): every change up to `revision` is committed, with the ids of this client's changes it committed */
     onDurable?: (revision: number, committed: readonly string[]) => void;
@@ -89,6 +96,14 @@ export interface SyncClient {
     emit: (name: string, value?: JsonValue) => boolean;
     /** How far the namespace is durable, as the authority last said (protocol 2); 0 before it says */
     durable: () => number;
+    /** Copies of the requests the client knows (protocol 3), in the order it learned them */
+    requests: () => SyncRequest[];
+    /** Approves a request this client may decide; false when not online. The authority answers with `decided` */
+    approve: (id: string) => boolean;
+    /** Rejects a request this client may decide, with a note for its requester; false when not online */
+    reject: (id: string, note?: string) => boolean;
+    /** Takes back a pending request of this client's; false when not online */
+    withdraw: (id: string) => boolean;
 }
 
 interface OutboxEntry {
@@ -126,6 +141,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     let confirmed: Store<any> = createStore({});
     let revision = 0;
     let outbox: OutboxEntry[] = [];
+    //the requests the authority told this client of, by id
+    let requests = new Map<string, SyncRequest>();
 
     //the parts changed since the last write to the local store
     const dirty = { confirmed: false, outbox: false };
@@ -357,6 +374,10 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         markDirty("confirmed");
         bridge.load(visibleState());
         welcomed = true;
+        if (message.requests !== undefined || requests.size > 0) {
+            requests = new Map((message.requests ?? []).map((request) => [request.id, request]));
+            requestsChanged();
+        }
         attempt = 0;
         setStatus("online");
         sendOutbox();
@@ -396,6 +417,24 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         reportStatus();
     };
 
+    const requestsChanged = () => options.onRequests?.([...requests.values()].map((request) => copyJson<SyncRequest>(request)));
+
+    const onDecided = (message: DecidedMessage) => {
+        const request = requests.get(message.id);
+        if (request === undefined) {
+            return;
+        }
+        requests.set(message.id, {
+            ...request,
+            status: message.status,
+            decidedAt: message.decidedAt,
+            ...(message.code === undefined ? {} : { code: message.code }),
+            ...(message.note === undefined ? {} : { note: message.note })
+        });
+        report(CATEGORY, "Request %s of %s was %s", [message.id, namespace, message.status]);
+        requestsChanged();
+    };
+
     const onAck = (message: AckMessage) => {
         const entry = removeFromOutbox(message.id);
         if (!entry) {
@@ -404,6 +443,12 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         const { path } = entry.change;
         if (isReported(CATEGORY)) {
             report(CATEGORY, "The authority %s the change of %s at %s", [message.result, namespace, path]);
+        }
+        if (message.result === "requested") {
+            //kept as a request (sent as `requested`), so the shared state shows only what the owner applied
+            refresh(path);
+            reportStatus();
+            return;
         }
         if (message.result === "rejected") {
             refresh(path);
@@ -466,6 +511,17 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             case "emit":
                 options.onEmit?.(message.name, message.value);
                 return;
+            case "requested":
+                if (welcomed) {
+                    requests.set(message.request.id, message.request);
+                    requestsChanged();
+                }
+                return;
+            case "decided":
+                if (welcomed) {
+                    onDecided(message);
+                }
+                return;
             case "error":
                 if (message.code === REVOKED_CODE) {
                     revoke(message.message);
@@ -476,6 +532,15 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             default:
                 report(CATEGORY, "Ignoring a %s message from the authority", [message.type]);
         }
+    };
+
+    /** Sends a decision on a request; false when not online */
+    const decide = (message: SyncMessage & { type: "approve" | "reject" | "withdraw" }): boolean => {
+        if (!welcomed) {
+            return false;
+        }
+        send(message);
+        return true;
     };
 
     /** Stops for good and deletes what the local store keeps of the namespace, the outbox included */
@@ -497,6 +562,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         dirty.confirmed = false;
         dirty.outbox = false;
         outbox = [];
+        requests = new Map();
         if (localStore) {
             forgetNamespace(localStore, namespace);
         }
@@ -657,6 +723,10 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             send(value === undefined ? { type: "emit", name } : { type: "emit", name, value });
             return true;
         },
-        durable: () => durable
+        durable: () => durable,
+        requests: () => [...requests.values()].map((request) => copyJson<SyncRequest>(request)),
+        approve: (id) => decide({ type: "approve", id }),
+        reject: (id, note) => decide(note === undefined ? { type: "reject", id } : { type: "reject", id, note }),
+        withdraw: (id) => decide({ type: "withdraw", id })
     };
 };

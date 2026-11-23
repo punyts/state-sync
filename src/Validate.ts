@@ -1,5 +1,5 @@
 import { CHANGE_OPS, type ChangeOp } from "./Change.js";
-import { PROTOCOL_VERSIONS, REJECTION_CODES, isRejectionCode, type ErrorMessage, type SyncErrorCode, type SyncMessage } from "./Messages.js";
+import { PROTOCOL_VERSIONS, REJECTION_CODES, REQUEST_STATUSES, isRejectionCode, type ErrorMessage, type RequestStatus, type SyncErrorCode, type SyncMessage } from "./Messages.js";
 import { isSyncPath } from "./Paths.js";
 
 /** The bounds parseMessage holds a message to */
@@ -182,6 +182,55 @@ const checkChanges = (value: unknown, where: string, limits: SyncLimits) => {
     value.forEach((change, index) => checkChange(change, `${where}[${index}]`, limits, true));
 };
 
+const checkTime = (value: unknown, where: string) => {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        fail(`${where} must be a time in milliseconds`);
+    }
+};
+
+const checkCode = (value: unknown, where: string) => {
+    if (!isRejectionCode(value)) {
+        fail(`${where} must be one of ${REJECTION_CODES.join(", ")}`);
+    }
+};
+
+const checkRequest = (value: unknown, where: string, limits: SyncLimits) => {
+    if (!isPlainObject(value)) {
+        return fail(`${where} must be an object`);
+    }
+    checkKeys(value, where, ["id", "path", "op", "base", "by", "mine", "at", "until", "status"], ["value", "decidedAt", "code", "note"]);
+    const { by, mine, at, until, status, decidedAt, code, note, ...change } = value;
+    checkChange(change, where, limits, false);
+    checkString(by, `${where}.by`, limits.maxIdLength);
+    if (typeof mine !== "boolean") {
+        fail(`${where}.mine must be a boolean`);
+    }
+    checkTime(at, `${where}.at`);
+    checkTime(until, `${where}.until`);
+    if (!REQUEST_STATUSES.includes(status as RequestStatus)) {
+        fail(`${where}.status must be one of ${REQUEST_STATUSES.join(", ")}`);
+    }
+    if (decidedAt !== undefined) {
+        checkTime(decidedAt, `${where}.decidedAt`);
+    }
+    if (code !== undefined) {
+        checkCode(code, `${where}.code`);
+    }
+    if (note !== undefined) {
+        checkString(note, `${where}.note`, limits.maxReasonLength, true);
+    }
+};
+
+const checkRequests = (value: unknown, where: string, limits: SyncLimits) => {
+    if (!Array.isArray(value)) {
+        return fail(`${where} must be an array`);
+    }
+    if (value.length > limits.maxChanges) {
+        fail(`${where} has more than ${limits.maxChanges} requests`);
+    }
+    value.forEach((request, index) => checkRequest(request, `${where}[${index}]`, limits));
+};
+
 const checkNamespace = (value: unknown, limits: SyncLimits) => {
     const namespace = checkString(value, "namespace", limits.maxNamespaceLength);
     if (!PATT_NAMESPACE.test(namespace)) {
@@ -201,11 +250,14 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
             }
             return;
         case "welcome":
-            checkKeys(message, "welcome", ["type", "namespace", "revision"], ["changes", "snapshot", "durable"]);
+            checkKeys(message, "welcome", ["type", "namespace", "revision"], ["changes", "snapshot", "durable", "requests"]);
             checkNamespace(message.namespace, limits);
             checkRevision(message.revision, "revision");
             if ("durable" in message) {
                 checkRevision(message.durable, "durable");
+            }
+            if ("requests" in message) {
+                checkRequests(message.requests, "requests", limits);
             }
             if (("changes" in message) === ("snapshot" in message)) {
                 fail("welcome must have exactly one of changes and snapshot");
@@ -247,12 +299,45 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
             else if (message.result === "rejected") {
                 checkKeys(message, "ack rejected", ["type", "id", "result", "reason"], ["code"]);
                 checkString(message.reason, "reason", limits.maxReasonLength);
-                if (message.code !== undefined && !isRejectionCode(message.code)) {
-                    fail(`code must be one of ${REJECTION_CODES.join(", ")}`);
+                if (message.code !== undefined) {
+                    checkCode(message.code, "code");
                 }
             }
+            else if (message.result === "requested") {
+                checkKeys(message, "ack requested", ["type", "id", "result"]);
+            }
             else {
-                fail("result must be one of applied, adjusted, rejected");
+                fail("result must be one of applied, adjusted, rejected, requested");
+            }
+            return;
+        case "requested":
+            checkKeys(message, "requested", ["type", "request"]);
+            checkRequest(message.request, "request", limits);
+            return;
+        case "decided":
+            checkKeys(message, "decided", ["type", "id", "status", "decidedAt"], ["code", "note"]);
+            checkString(message.id, "id", limits.maxIdLength);
+            if (message.status === "pending" || !REQUEST_STATUSES.includes(message.status as RequestStatus)) {
+                fail(`status must be one of ${REQUEST_STATUSES.filter((status) => status !== "pending").join(", ")}`);
+            }
+            checkTime(message.decidedAt, "decidedAt");
+            if ("code" in message) {
+                checkCode(message.code, "code");
+            }
+            if ("note" in message) {
+                checkString(message.note, "note", limits.maxReasonLength, true);
+            }
+            return;
+        case "approve":
+        case "withdraw":
+            checkKeys(message, message.type, ["type", "id"]);
+            checkString(message.id, "id", limits.maxIdLength);
+            return;
+        case "reject":
+            checkKeys(message, "reject", ["type", "id"], ["note"]);
+            checkString(message.id, "id", limits.maxIdLength);
+            if ("note" in message) {
+                checkString(message.note, "note", limits.maxReasonLength, true);
             }
             return;
         case "emit":

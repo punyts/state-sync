@@ -2,8 +2,8 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sig
 import type { KeyObject } from "node:crypto";
 import { compilePattern, pathSteps, patternContains, patternCovers, stepAdmits, type PathPattern } from "@punyts/state";
 
-/** What a grant lets its subject do under its pattern */
-export type GrantRight = "read" | "write";
+/** What a grant lets its subject do under its pattern: read, write, or ask for a write that waits for a decision (request) */
+export type GrantRight = "read" | "write" | "request";
 
 /**
  * A right to read or write the paths a pattern covers under one owner (docs/design/statenet-permissions.md, "Tokens"),

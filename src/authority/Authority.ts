@@ -2,13 +2,13 @@ import { isReported, report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "../Apply.js";
 import type { Change, JsonValue, RevisedChange } from "../Change.js";
-import type { AckMessage, HelloMessage, SyncMessage } from "../Messages.js";
+import { PROTOCOL_VERSION, type AckMessage, type HelloMessage, type RequestErrorCode, type RequestStatus, type SyncMessage, type SyncRequest } from "../Messages.js";
 import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
-import type { AppliedChange, NamespaceStorage, StoredNamespace } from "./NamespaceStorage.js";
+import { serialOf, type AppliedChange, type NamespaceStorage, type StoredNamespace, type StoredRequest } from "./NamespaceStorage.js";
 import { mayTouch, pathSteps, patternCovers, type PathPattern } from "@punyts/state";
-import { checkAccess, grantPattern, type Access, type GrantContext } from "./Grants.js";
+import { checkAccess, grantPattern, type Access, type AccessAllowed, type GrantContext } from "./Grants.js";
 import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
 
 /** The error codes an authority sends besides those of parseMessage (which also refuses another protocol version) */
@@ -67,7 +67,40 @@ export interface AuthorityOptions {
      * stops working at once. Without it the caller decides who connects
      */
     access?: { address: string; context: () => GrantContext };
+    /**
+     * Requests (docs/design/statenet-requests.md), with `access`: a change from a protocol 3 session that may request
+     * and not write its path waits as a request until the owner, or someone who may read and write the path, decides it
+     */
+    requests?: RequestOptions;
 }
+
+export interface RequestOptions {
+    /** How long a request waits for a decision; 7 days by default, never past the grant that allowed it */
+    lifeMs?: number;
+    /** How long a decided request is kept, so its requester learns the decision; 30 days by default */
+    keepMs?: number;
+    /** The most pending requests of one requester; 50 by default */
+    perRequester?: number;
+    /** The most pending requests of the namespace; 1000 by default */
+    max?: number;
+    /** How often expiry and revocation are checked while the authority runs; a minute by default */
+    sweepMs?: number;
+    /** The clock, in milliseconds since the epoch; Date.now by default */
+    now?: () => number;
+}
+
+/** A decision on a request: by someone who may decide it (approve, reject), or by its requester (withdraw) */
+export interface RequestDecision {
+    id: string;
+    action: "approve" | "reject" | "withdraw";
+    /** A rejection's note for the requester */
+    note?: string;
+}
+
+/** What a decision came to: the request's status after it, or why it was not made */
+export type DecisionOutcome =
+    | { ok: true; status: Exclude<RequestStatus, "pending"> }
+    | { ok: false; code: RequestErrorCode; reason: string };
 
 /** What a change handler gets */
 export interface ChangeContext {
@@ -81,6 +114,8 @@ export interface ChangeContext {
     stale: boolean;
     /** The logged changes after the change's base, oldest first */
     since: RevisedChange[];
+    /** An approved request: who asked and when, and who approved it */
+    request?: { by: string; at: number; approvedBy: string };
 }
 
 /** A handler's answer; undefined applies the change */
@@ -106,6 +141,15 @@ export interface Authority {
     readonly namespace: string;
     /** Takes a client connection; the caller passes its messages and its close to the session */
     connect: (connection: AuthorityConnection, access?: Access) => AuthoritySession;
+    /**
+     * A change as a session's would be handled, for a caller that orders changes itself (an owner node), answered at
+     * once. `protocol` is the sender's (3 by default): below 3 a change that would be a request is rejected
+     */
+    submit: (change: Change, from: { clientId: string; access?: Access; protocol?: number }) => Omit<AckMessage, "type">;
+    /** Decides a request as `access` (the owner, someone who may read and write its path, or its requester) */
+    decide: (decision: RequestDecision, access?: Access) => DecisionOutcome;
+    /** Copies of the requests: pending, and decided ones still kept */
+    requests: () => StoredRequest[];
     /**
      * Registers server logic for client changes at, below or above the paths a pattern matches ("*" matches one
      * segment); returns the function that removes it
@@ -168,7 +212,11 @@ interface Session {
     protocol: number;
     /** Who the connection is and the grant it presents, for `AuthorityOptions.access` */
     access?: Access;
+    /** Takes the session's acks in place of its connection (`submit`) */
+    answer?: (ack: Omit<AckMessage, "type">) => void;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** A path pattern of an authority's options or handlers (`$`, `$.presence.*`), read by @punyts/state's matcher */
 const patternOf = (source: string): PathPattern => {
@@ -244,6 +292,15 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const log: RevisedChange[] = (stored?.log ?? []).slice(-logLength);
     //insertion order is the order the ids were applied in
     const applied = new Map<string, number>((stored?.applied ?? []).map(({ id, revision }) => [id, revision]));
+    const requests = new Map<string, StoredRequest>((stored?.requests ?? []).map((request) => [request.change.id, request]));
+    //counts every change to what is saved, so a storage tells a save sent again from a new one
+    let serial = stored === undefined ? 0 : serialOf(stored);
+    const requestOptions = options.requests ?? {};
+    const lifeMs = requestOptions.lifeMs ?? 7 * DAY_MS;
+    const keepMs = requestOptions.keepMs ?? 30 * DAY_MS;
+    const perRequester = requestOptions.perRequester ?? 50;
+    const maxRequests = requestOptions.max ?? 1000;
+    const now = requestOptions.now ?? Date.now;
     report(CATEGORY, "Loaded %s at revision %s from %s in %s ms, %s changes logged", [namespace, revision, stored === undefined ? "the initial state" : "storage", elapsed(loadStart), log.length]);
 
     const sessions = new Set<Session>();
@@ -322,7 +379,9 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             state,
             revision,
             log: copyJson<RevisedChange[]>(log.filter((logged) => logged.ephemeral !== true)),
-            applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision }))
+            applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision })),
+            serial,
+            ...(requests.size === 0 ? {} : { requests: copyJson<StoredRequest[]>([...requests.values()]) })
         };
     };
 
@@ -360,6 +419,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const scheduleSave = () => {
         dirty = true;
         unsaved++;
+        serial++;
         queueSave();
     };
 
@@ -421,16 +481,177 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const logged = hello.revision > 0 && missing >= 0 && missing <= log.length && missing <= limits.maxChanges;
         const durable = hello.protocol >= 2 ? { durable: durableRevision } : {};
         const changes = log.slice(log.length - missing);
-        send(session, logged
-            ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable }
-            : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable });
-        session.welcomed = true;
         session.clientId = hello.clientId;
         session.protocol = hello.protocol;
+        sweep();
+        const context = options.access?.context();
+        const asked = hello.protocol >= 3 ? { requests: [...requests.values()].filter((request) => sees(session, request, context)).map((request) => syncRequest(request, session)) } : {};
+        send(session, logged
+            ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable, ...asked }
+            : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable, ...asked });
+        session.welcomed = true;
         report(CATEGORY, "Welcomed client %s to %s at revision %s with %s (protocol %s)", [hello.clientId, namespace, revision, logged ? `${changes.length} changes since ${hello.revision}` : "a snapshot", hello.protocol]);
     };
 
-    const ack = (session: Session, message: Omit<AckMessage, "type">) => send(session, { type: "ack", ...message });
+    const ack = (session: Session, message: Omit<AckMessage, "type">) => {
+        if (session.answer !== undefined) {
+            session.answer(message);
+            return;
+        }
+        send(session, { type: "ack", ...message });
+    };
+
+    /** Whether an access may decide a request at a path: the owner, or someone who may read (not cut) and write it */
+    const mayDecide = (access: Access | undefined, path: string, context: GrantContext | undefined): boolean => {
+        if (options.access === undefined || context === undefined) {
+            return false;
+        }
+        const need = { address: options.access.address, path };
+        const read = checkAccess(access, { ...need, right: "read" }, context);
+        return read.ok && read.cut === undefined && checkAccess(access, { ...need, right: "write" }, context).ok;
+    };
+
+    const isMine = (session: Session, request: StoredRequest) => session.access !== undefined && session.access.subject === request.by;
+
+    /** Whether a session is told of a request: a protocol 3 session of its requester, or of someone who may decide it while it is pending */
+    const sees = (session: Session, request: StoredRequest, context: GrantContext | undefined): boolean =>
+        session.protocol >= 3 && (isMine(session, request) || (request.status === "pending" && mayDecide(session.access, request.change.path, context)));
+
+    /** A request as a session is sent it */
+    const syncRequest = (request: StoredRequest, session: Session): SyncRequest => {
+        const { id, path, op, value, base } = request.change;
+        return {
+            id, path, op, ...(value === undefined ? {} : { value: copyJson(value) }), base,
+            by: request.by, mine: isMine(session, request), at: request.at, until: request.until, status: request.status,
+            ...(request.decidedAt === undefined ? {} : { decidedAt: request.decidedAt }),
+            ...(request.code === undefined ? {} : { code: request.code }),
+            ...(request.note === undefined ? {} : { note: request.note })
+        };
+    };
+
+    /** Ends a pending request with a status, saves it and tells every session that sees it */
+    const endRequest = (request: StoredRequest, status: Exclude<RequestStatus, "pending">, decided: Pick<StoredRequest, "decidedBy" | "code" | "note" | "revision"> = {}): DecisionOutcome => {
+        const context = options.access?.context();
+        //told to those who saw it pending: a decider who could decide it then
+        const told = [...sessions].filter((session) => session.welcomed && sees(session, request, context));
+        Object.assign(request, { status, decidedAt: now() }, decided);
+        scheduleSave();
+        report(CATEGORY, "Request %s in %s ended %s", [request.change.id, namespace, status]);
+        for (const session of told) {
+            send(session, {
+                type: "decided", id: request.change.id, status, decidedAt: request.decidedAt as number,
+                ...(request.code === undefined ? {} : { code: request.code }),
+                ...(request.note === undefined ? {} : { note: request.note })
+            });
+        }
+        return { ok: true, status };
+    };
+
+    /**
+     * Ends the pending requests whose time ran out or whose permission was revoked, and drops the decided ones kept
+     * long enough
+     */
+    const sweep = () => {
+        if (requests.size === 0) {
+            return;
+        }
+        const at = now();
+        const context = options.access?.context();
+        for (const request of [...requests.values()]) {
+            if (request.status === "pending") {
+                if (request.chain.some((entry) => context?.revoked?.(entry) === true)) {
+                    endRequest(request, "revoked");
+                }
+                else if (request.until <= at) {
+                    endRequest(request, "expired");
+                }
+            }
+            else if ((request.decidedAt ?? request.at) + keepMs <= at) {
+                requests.delete(request.change.id);
+                scheduleSave();
+            }
+        }
+    };
+
+    /** Keeps a change from someone who may only request it as a pending request, and tells who sees it */
+    const makeRequest = (session: Session, received: Change, allowed: AccessAllowed) => {
+        const by = (session.access as Access).subject;
+        const pending = [...requests.values()].filter((request) => request.status === "pending");
+        if (pending.length >= maxRequests || pending.filter((request) => request.by === by).length >= perRequester) {
+            rejected(session, received, "too many requests");
+            ack(session, { id: received.id, result: "rejected", reason: `${namespace} holds too many requests`, code: "unsaved" });
+            return;
+        }
+        const at = now();
+        const request: StoredRequest = { change: copyJson<Change>(received), clientId: session.clientId, by, chain: [...allowed.chain], at, until: Math.min(at + lifeMs, allowed.expires), status: "pending" };
+        requests.set(received.id, request);
+        scheduleSave();
+        if (isReported(CATEGORY)) {
+            report(CATEGORY, "Client %s requested a %s at %s in %s", [session.clientId, received.op, received.path, namespace]);
+        }
+        ack(session, { id: received.id, result: "requested" });
+        const context = options.access?.context();
+        for (const other of sessions) {
+            if (other.welcomed && sees(other, request, context)) {
+                send(other, { type: "requested", request: syncRequest(request, other) });
+            }
+        }
+    };
+
+    /** Approves, rejects or withdraws a pending request as an access */
+    const decide = (decision: RequestDecision, access: Access | undefined): DecisionOutcome => {
+        sweep();
+        const request = requests.get(decision.id);
+        if (request === undefined || request.status !== "pending") {
+            return { ok: false, code: "no-request", reason: `${namespace} has no pending request ${decision.id}` };
+        }
+        if (decision.action === "withdraw") {
+            return access?.subject === request.by
+                ? endRequest(request, "withdrawn")
+                : { ok: false, code: "not-allowed", reason: "only its requester withdraws a request" };
+        }
+        const context = options.access?.context();
+        if (access === undefined || !mayDecide(access, request.change.path, context)) {
+            return { ok: false, code: "not-allowed", reason: `deciding a request at ${request.change.path} needs read and write` };
+        }
+        if (decision.action === "reject") {
+            return endRequest(request, "rejected", { decidedBy: access.subject, ...(decision.note === undefined ? {} : { note: decision.note }) });
+        }
+        if (!isEphemeral(request.change.path) && holdsTooMany()) {
+            return { ok: false, code: "unsaved", reason: `${namespace} holds ${unsaved} changes that are not saved yet` };
+        }
+        const outcome = runHandlers(request.clientId, request.change, { by: request.by, at: request.at, approvedBy: access.subject });
+        if ("reason" in outcome) {
+            return endRequest(request, "rejected", { decidedBy: access.subject, code: "logic" });
+        }
+        const { change } = outcome;
+        if (missingParent(change) !== undefined) {
+            return endRequest(request, "rejected", { decidedBy: access.subject, code: "invalid" });
+        }
+        //pushed to every session, the requester's too: the change arrives as any change does
+        const revised = commit(change);
+        rememberApplied(change.id, revised.revision);
+        const ended = endRequest(request, "approved", { decidedBy: access.subject, revision: revised.revision });
+        runApplied(revised, request.clientId);
+        return ended;
+    };
+
+    const rememberApplied = (id: string, at: number) => {
+        applied.set(id, at);
+        if (applied.size > appliedLength) {
+            applied.delete(applied.keys().next().value!);
+        }
+    };
+
+    const runApplied = (revised: RevisedChange, clientId: string) => {
+        for (const handler of [...appliedHandlers]) {
+            try {
+                handler(copyJson(revised), clientId);
+            } catch (error) {
+                report(CATEGORY, "Server logic after a change of %s failed: %s", [namespace, errorName(error)]);
+            }
+        }
+    };
 
     /** Why the change cannot be applied to the store, or undefined when it can */
     const missingParent = (change: Pick<Change, "path" | "op">): string | undefined => {
@@ -522,7 +743,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     };
 
     /** Runs the handlers that touch the change in registration order: the change as adjusted, or the first rejection */
-    const runHandlers = (session: Session, received: Change): { change: Change; adjusted: boolean } | { reason: string } => {
+    const runHandlers = (clientId: string, received: Change, request?: ChangeContext["request"]): { change: Change; adjusted: boolean } | { reason: string } => {
         let change = received;
         let adjusted = false;
         const since = log.filter((logged) => logged.revision > received.base);
@@ -536,10 +757,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             try {
                 verdict = handler({
                     change: copyJson<Change>(change),
-                    clientId: session.clientId,
+                    clientId,
                     get: (path) => copyJson(store.get(path)),
                     stale,
-                    since: copyJson<RevisedChange[]>(since)
+                    since: copyJson<RevisedChange[]>(since),
+                    ...(request === undefined ? {} : { request: { ...request } })
                 });
             }
             catch (error) {
@@ -573,6 +795,20 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             ack(session, { id: received.id, result: "applied", revision: known });
             return;
         }
+        const asked = requests.get(received.id);
+        if (asked !== undefined) {
+            //a request sent again: the same answer as the first time, or the decision since
+            if (asked.status === "pending") {
+                ack(session, { id: received.id, result: "requested" });
+            }
+            else if (asked.status === "approved" && asked.revision !== undefined) {
+                ack(session, { id: received.id, result: "applied", revision: asked.revision });
+            }
+            else {
+                ack(session, { id: received.id, result: "rejected", reason: `the request was ${asked.status}`, code: asked.code ?? "access" });
+            }
+            return;
+        }
         if (isAtOrBelow(received.path, SERVER_PATH)) {
             rejected(session, received, "server-only");
             ack(session, { id: received.id, result: "rejected", reason: `${SERVER_PATH} is server-only`, code: "invalid" });
@@ -584,14 +820,23 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         if (options.access !== undefined) {
-            const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, options.access.context());
+            const context = options.access.context();
+            const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, context);
+            //without write, a protocol 3 session that may request the path asks for the change
+            const asking = allowed.ok || session.protocol < 3 || session.access === undefined
+                ? undefined
+                : checkAccess(session.access, { address: options.access.address, path: received.path, right: "request" }, context);
+            if (asking?.ok === true) {
+                makeRequest(session, received, asking);
+                return;
+            }
             if (!allowed.ok) {
                 rejected(session, received, "no write access");
                 ack(session, { id: received.id, result: "rejected", reason: allowed.reason, code: "access" });
                 return;
             }
         }
-        const outcome = runHandlers(session, received);
+        const outcome = runHandlers(session.clientId, received);
         if ("reason" in outcome) {
             rejected(session, received, "server logic");
             ack(session, { id: received.id, result: "rejected", reason: outcome.reason, code: "logic" });
@@ -610,20 +855,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         if (isReported(CATEGORY)) {
             report(CATEGORY, "%s the %s of client %s at %s in %s at revision %s", [adjusted ? "Adjusted" : "Applied", change.op, session.clientId, change.path, namespace, at]);
         }
-        applied.set(change.id, at);
-        if (applied.size > appliedLength) {
-            applied.delete(applied.keys().next().value!);
-        }
+        rememberApplied(change.id, at);
         ack(session, adjusted
             ? { id: change.id, result: "adjusted", revision: at, value: copyJson(change.value) }
             : { id: change.id, result: "applied", revision: at });
-        for (const handler of [...appliedHandlers]) {
-            try {
-                handler(copyJson(revised), session.clientId);
-            } catch (error) {
-                report(CATEGORY, "Server logic after a change of %s failed: %s", [namespace, errorName(error)]);
-            }
-        }
+        runApplied(revised, session.clientId);
     };
 
     const onEmit = (session: Session, name: string, value: JsonValue | undefined) => {
@@ -666,6 +902,20 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 }
                 onEmit(session, message.name, message.value);
                 return;
+            case "approve":
+            case "reject":
+            case "withdraw": {
+                if (!session.welcomed) {
+                    refuse(session, "no-hello", "send hello first", false);
+                    return;
+                }
+                const outcome = decide({ id: message.id, action: message.type, ...(message.type === "reject" && message.note !== undefined ? { note: message.note } : {}) }, session.access);
+                if (!outcome.ok) {
+                    report(CATEGORY, "Refused to %s request %s in %s for client %s: %s", [message.type, message.id, namespace, session.clientId, outcome.code]);
+                    send(session, { type: "error", code: outcome.code, message: outcome.reason });
+                }
+                return;
+            }
             case "error":
                 report(CATEGORY, "A client of %s sent the error %s", [namespace, message.code]);
                 return;
@@ -674,8 +924,33 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
     };
 
+    sweep();
+    const sweeping = options.access === undefined ? undefined : setInterval(sweep, Math.max(10, requestOptions.sweepMs ?? 60_000));
+    (sweeping as { unref?: () => void } | undefined)?.unref?.();
+
     return {
         namespace,
+        submit: (change, from) => {
+            const parsed = parseMessage({ type: "change", change }, limits);
+            if (!parsed.ok) {
+                return { id: change.id, result: "rejected", reason: parsed.error.message, code: "invalid" };
+            }
+            let answer: Omit<AckMessage, "type"> | undefined;
+            const session: Session = {
+                connection: { send: () => undefined, close: () => undefined },
+                welcomed: true,
+                clientId: from.clientId,
+                protocol: from.protocol ?? PROTOCOL_VERSION,
+                ...(from.access === undefined ? {} : { access: from.access }),
+                answer: (given) => {
+                    answer = given;
+                }
+            };
+            onChange(session, copyJson<Change>(change));
+            return answer ?? { id: change.id, result: "rejected", reason: "the change was not answered", code: "invalid" };
+        },
+        decide: (decision, access) => decide(decision, access),
+        requests: () => copyJson<StoredRequest[]>([...requests.values()]),
         connect: (connection, access) => {
             const session: Session = { connection, welcomed: false, clientId: "", protocol: 1, ...(access === undefined ? {} : { access }) };
             sessions.add(session);
@@ -784,6 +1059,9 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             };
         },
         close: () => {
+            if (sweeping !== undefined) {
+                clearInterval(sweeping);
+            }
             report(CATEGORY, "Closed %s at revision %s with %s connections", [namespace, revision, sessions.size]);
             for (const session of [...sessions]) {
                 sessions.delete(session);

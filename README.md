@@ -43,11 +43,14 @@ interface RevisedChange extends Change { revision: number }   // accepted by the
 
 | type | sent by | fields |
 |---|---|---|
-| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (1) |
-| `welcome` | authority | `namespace`, `revision`, and exactly one of `changes` (since the client's revision) or `snapshot` |
+| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (`PROTOCOL_VERSION`, 3; an authority speaks 1 to 3) |
+| `welcome` | authority | `namespace`, `revision`, and exactly one of `changes` (since the client's revision) or `snapshot`; protocol 2 adds `durable`, protocol 3 `requests` |
 | `changes` | authority | `changes`: revised changes from other clients or server logic |
 | `change` | client | `change` |
-| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be |
+| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be; `requested` (protocol 3): kept as a request of the same id |
+| `requested` | authority | `request` (`SyncRequest`): a new request, to its requester and to each client that may decide it |
+| `decided` | authority | `id`, `status` (`approved`, `rejected`, `expired`, `withdrawn`, `revoked`), `decidedAt`, optional `code` and `note` |
+| `approve`, `reject`, `withdraw` | client | `id`; `reject` takes an optional `note`. A decision the authority does not make is an `error`: `no-request`, `not-allowed` or `unsaved` |
 | `emit` | either | `name`, optional `value` |
 | `error` | either | `code`, `message` |
 
@@ -140,6 +143,12 @@ client.start();
   catch-up, or are acked again by id when they are resent.
 - `initial: { state, revision, outbox }` is mounted into the store on `start`, before connecting; `client.state()`
   returns the same shape to keep. `client.emit(name, value)` sends an event when online and returns `false` otherwise.
+- **Requests** (protocol 3, docs/design/statenet-requests.md). A change acked `requested` leaves the outbox and its
+  path shows the confirmed value again, as a rejected one does: the shared state shows only what the owner applied.
+  The client keeps the requests the authority tells it of, its own and those it may decide, from `welcome`,
+  `requested` and `decided`; `onRequests(requests)` is called with all of them as they are now, and
+  `client.requests()` returns copies. `client.approve(id)`, `client.reject(id, note?)` and `client.withdraw(id)` send
+  a decision when online and return `false` otherwise. An approved change arrives as any change does.
 
 ### Local store and Standalone
 
@@ -189,8 +198,25 @@ wss.on("connection", (socket) => {
   arrival order (stale or not), logged, acked `applied`, and pushed as `changes` to every other welcomed connection.
 - **Messages** are handled one at a time in arrival order; every message is checked with `parseMessage`, and a refused
   one is answered with its `error`.
-- **Storage.** `NamespaceStorage` is the port: `load(namespace)` and `save(namespace, { state, revision, log, applied
-  })`, both async. After each change a save is scheduled, coalesced to a microtask, one save at a time; a failed save is
+- **Requests** (`access` and `requests` options; docs/design/statenet-requests.md). A change from a protocol 3 session
+  whose access may `request` its path and not `write` it is not applied: it is kept as a pending request (its id is the
+  change's), acked `requested`, and sent as `requested` to the requester's sessions and to every session that may
+  decide it: the owner, or someone who may read (not cut) and write the path. A protocol 1 or 2 session gets `access`
+  instead. `approve` runs the change through the change handlers as the requester's, with `stale` from its base and
+  `request: { by, at, approvedBy }` in the context, and applies it as a server write is pushed; a handler's rejection or
+  a missing parent ends it `rejected` with the code `logic` or `invalid`. `reject` ends it with a note, and only its
+  requester may `withdraw` it. A request lives `lifeMs` (7 days) and never past the grant that allowed it, ends
+  `revoked` when an entry its grant rests on is revoked, and a decided one is kept `keepMs` (30 days) for its
+  requester's next welcome; this is checked at load, at each hello and decision and every `sweepMs` (a minute). At most
+  `perRequester` (50) pending requests of one requester and `max` (1000) of the namespace; past either a request is
+  acked `rejected` with `unsaved`. Requests are saved in `StoredNamespace.requests`, never in the state or the log.
+  `authority.decide(decision, access)` decides as an access, `authority.requests()` lists copies.
+- **submit.** `authority.submit(change, { clientId, access?, protocol? })` handles a change as a session's and answers
+  its ack at once: an owner node orders the writes it is given, with their access, through it.
+- **Storage.** `NamespaceStorage` is the port: `load(namespace)` and `save(namespace, { state, revision, log, applied,
+  serial, requests })`, both async. `serial` counts every change to what is saved, those that take no revision too (a
+  `$.server` write, a request), so an `EpochStorage` tells a save sent again from a new one (`isResave`: a lower
+  revision, or the same revision and a serial no higher); a namespace stored without it starts at its revision. After each change a save is scheduled, coalesced to a microtask, one save at a time; a failed save is
   reported and the next change saves again. `flush()` waits for the pending saves. `createMemoryNamespaceStorage()` is
   the adapter for tests.
 - **Unsaved changes.** While saves do not land (a node whose link to its aggregate is down holds its save until the
@@ -240,7 +266,7 @@ authority.emit("notice", { text: "saved" });
 A grant (`signGrant`, `verifyGrant`, `checkAccess`) lets its subject read or write the paths a pattern covers in one
 owner's tree (docs/design/statenet-permissions.md, "Tokens"). Its claims are `entry` (the permission entry it was
 made from), `kid`, `issuer`, `subject`, `owner`, `pattern` (`$`, `$.apps.a1`, `$.apps.*.files`), `rights`
-(`read`, `write`), `issued`, `expires` and the `parent` it was passed on from, signed with Ed25519.
+(`read`, `write`, `request`), `issued`, `expires` and the `parent` it was passed on from, signed with Ed25519.
 
 - A namespace's path is placed in its owner's tree by its address: `addressPath("alice/apps/a1", "$.files")` is
   `$.apps.a1.files` of `alice`. The owner needs no grant.

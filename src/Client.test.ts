@@ -54,7 +54,7 @@ describe("createSyncClient", () => {
 
             await network.settle();
 
-            expect(network.received[0]).toEqual({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "tab-1", protocol: 2 });
+            expect(network.received[0]).toEqual({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "tab-1", protocol: 3 });
         });
 
         it("should load the snapshot of welcome into the store and go online", async () => {
