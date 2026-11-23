@@ -31,7 +31,11 @@ export interface OwnershipStore {
     renew(address: string, node: string, epoch: number, leaseMs: number): Promise<boolean>;
 }
 
-/** Storage that knows epochs: a save from an epoch older than the newest it has seen for the namespace is refused */
+/**
+ * Storage that knows epochs: a save from an epoch older than the newest it has seen for the namespace is refused, and
+ * one at or below the revision stored under its own epoch writes nothing (it is a save sent again: one owner's save of
+ * a revision is always the same), so a resend after a restart neither writes twice nor takes the state back
+ */
 export interface EpochStorage {
     load(address: string): Promise<StoredNamespace | undefined>;
     save(address: string, stored: StoredNamespace, epoch: number): Promise<void>;
@@ -86,10 +90,12 @@ export const createMemoryEpochStorage = (): EpochStorage & { epochOf: (address: 
             return found === undefined ? undefined : structuredClone(found.stored);
         },
         save: async (address, stored, epoch) => {
-            const current = namespaces.get(address)?.epoch ?? 0;
+            const found = namespaces.get(address);
+            const current = found?.epoch ?? 0;
             if (epoch < current) {
                 throw new FencedError(address, epoch, current);
             }
+            if (found !== undefined && epoch === current && stored.revision <= found.stored.revision) return;
             namespaces.set(address, { stored: structuredClone(stored), epoch });
         },
         epochOf: (address) => namespaces.get(address)?.epoch ?? 0
