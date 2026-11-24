@@ -307,7 +307,7 @@ export function createSyncWire(limits: Partial<SyncLimits> = {}): SyncWire {
     const refuse = (code: "too-large" | "invalid-message", message: string): ParseResult => ({ ok: false, error: { type: "error", code, message } });
 
     return {
-        write: (message) => (message.type === "hello" || message.type === "error" ? JSON.stringify(message) : encodeCbor(encode(message), { bytes: true })),
+        write: (message) => (message.type === "hello" || message.type === "error" ? JSON.stringify(message) : encodeCbor(encode(message), { bytes: true, maxDepth: cbor.limits.maxDepth })),
         read: (data) => {
             if (typeof data === "string") {
                 const parsed = parseMessage(data, bounds);

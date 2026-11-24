@@ -52,6 +52,13 @@ export interface CborOptions {
     bytes?: boolean;
 }
 
+export interface CborEncodeOptions extends CborOptions {
+    /** Leave out a map member whose value is undefined, as `JSON.stringify` does, instead of refusing it */
+    omitUndefined?: boolean;
+    /** The deepest nesting written; `DEFAULT_CBOR_LIMITS.maxDepth` by default */
+    maxDepth?: number;
+}
+
 export interface CborDecodeOptions extends CborOptions {
     limits?: Partial<CborLimits>;
 }
@@ -182,13 +189,15 @@ const isPlainObject = (value: object): boolean => {
 
 /**
  * Encodes a value as CBOR. A safe integer is a CBOR integer (-0 as 0, as JSON writes it), another number a float32
- * when that holds it exactly, else a float64. NaN, infinities, `undefined`, a byte string without `bytes`, and
- * anything that is not a JSON value throw `unsupported`; nesting past the default `maxDepth` throws `too-deep`
+ * when that holds it exactly, else a float64. NaN, infinities, `undefined` (but a map member's with `omitUndefined`),
+ * a byte string without `bytes`, and anything that is not a JSON value throw `unsupported`; nesting past `maxDepth`
+ * throws `too-deep`
  */
-export function encodeCbor(value: JsonValue | CborValue, options: CborOptions = {}): Uint8Array {
+export function encodeCbor(value: JsonValue | CborValue, options: CborEncodeOptions = {}): Uint8Array {
     const writer = new Writer();
     const bytes = options.bytes === true;
-    const maxDepth = DEFAULT_CBOR_LIMITS.maxDepth;
+    const omit = options.omitUndefined === true;
+    const maxDepth = options.maxDepth ?? DEFAULT_CBOR_LIMITS.maxDepth;
 
     const write = (item: unknown, depth: number): void => {
         if (item === null) {
@@ -230,7 +239,7 @@ export function encodeCbor(value: JsonValue | CborValue, options: CborOptions = 
             return;
         }
         if (!isPlainObject(item)) throw new CborError("unsupported", "an object must be a plain object");
-        const keys = Object.keys(item);
+        const keys = omit ? Object.keys(item).filter((key) => (item as Record<string, unknown>)[key] !== undefined) : Object.keys(item);
         writer.head(MAJOR_MAP, keys.length);
         for (const key of keys) {
             write(key, depth + 1);

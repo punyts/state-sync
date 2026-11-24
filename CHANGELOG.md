@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **`encodeCbor` leaves out undefined members when asked, and writes as deep as it is told** (docs/design/
+  statenet-wire-format.md, W3). `CborEncodeOptions` adds `omitUndefined` and `maxDepth`; statenet's mesh protocol 5
+  uses both. Fix: the sync wire writes to the depth it reads (`maxDepth` + 4), so a change whose value is at the
+  sync depth limit no longer throws when sent. Tests: `src/Cbor.test.ts` ("should leave out a member that is undefined
+  only when asked to…"), `src/Wire.test.ts` ("should write and read a change whose value is as deep as the limits
+  allow").
 - **Sync protocol 4: binary after hello** (docs/design/statenet-wire-format.md, W2). Breaking: `PROTOCOL_VERSION` is 4
   and `PROTOCOL_VERSIONS` `[4]`; a hello of 1 to 3 is `invalid-message`. `createSyncWire(limits?)` (`src/Wire.ts`) is
   one connection's side: `hello` and `error` stay JSON text, every other message is a CBOR array `[code, …fields]`

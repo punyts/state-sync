@@ -142,6 +142,26 @@ describe("encodeCbor and decodeCbor", () => {
         expect(deep).toBe("too-deep");
     });
 
+    it("should leave out a member that is undefined only when asked to, and write as deep as it is told", () => {
+        // Arrange
+        const value = { a: 1, gone: undefined, b: [2] } as unknown as JsonValue;
+        let deep: JsonValue = 1;
+        for (let level = 0; level < 70; level++) deep = [deep];
+
+        // Act
+        const omitted = decodeCbor(encodeCbor(value, { omitUndefined: true }));
+        const refused = codeOf(() => encodeCbor(value));
+        const tooDeep = codeOf(() => encodeCbor(deep));
+        const deeper = decodeCbor(encodeCbor(deep, { maxDepth: 80 }), { limits: { maxDepth: 80 } });
+
+        // Assert
+        expect(omitted).toEqual({ a: 1, b: [2] });
+        expect(Object.keys(omitted as object)).toEqual(["a", "b"]);
+        expect(refused).toBe("unsupported");
+        expect(tooDeep).toBe("too-deep");
+        expect(deeper).toEqual(deep);
+    });
+
     it("should carry byte strings only when asked to", () => {
         // Arrange
         const id = bytesOf("0f1e2d3c4b5a69788796a5b4c3d2e1f0");

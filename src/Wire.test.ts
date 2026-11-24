@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { decodeCbor, encodeCbor } from "./Cbor.js";
+import type { JsonValue } from "./Change.js";
 import type { SyncMessage, SyncRequest } from "./Messages.js";
+import { DEFAULT_SYNC_LIMITS } from "./Validate.js";
 import { createSyncWire, MAX_WIRE_PATHS, wireTypeOf } from "./Wire.js";
 
 const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -124,6 +126,21 @@ describe("createSyncWire", () => {
 
         // Assert
         expect(read).toEqual({ ok: true, message: later });
+    });
+
+    it("should write and read a change whose value is as deep as the limits allow", () => {
+        // Arrange
+        const sender = createSyncWire();
+        const receiver = createSyncWire();
+        let value: JsonValue = 1;
+        for (let level = 0; level < DEFAULT_SYNC_LIMITS.maxDepth - 1; level++) value = { v: value };
+        const message: SyncMessage = { type: "changes", changes: [{ revision: 1, id: "c1", path: "$.data.deep", op: "set", value, base: 0 }] };
+
+        // Act
+        const read = receiver.read(sender.write(message));
+
+        // Assert
+        expect(read).toEqual({ ok: true, message });
     });
 
     it("should refuse a message that is not hello or error as text, and a hello as bytes", () => {
