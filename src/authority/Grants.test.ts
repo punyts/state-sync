@@ -1,3 +1,4 @@
+import { connectJson } from "../__fixtures__/Wired.js";
 import { describe, expect, it } from "vitest";
 import type { SyncMessage } from "../Messages.js";
 import { createAuthority } from "./Authority.js";
@@ -189,8 +190,8 @@ describe("grants at the relay and the owner node", () => {
         const authority = await createAuthority({ namespace: "alice.notes", storage: createMemoryNamespaceStorage(), initial: { data: { notes: {} } }, access: { address: ADDRESS, context: () => ({ keyOf, now: NOW, revoked: (id) => revocations.has(id) }) } });
         const grant = root(alice.privateKey, { pattern: "$.apps.notes.data.notes" });
         const received: SyncMessage[] = [];
-        const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, { subject: "bob", grant });
-        session.receive(JSON.stringify({ type: "hello", namespace: "alice.notes", revision: 0, clientId: "b", protocol: 2 }));
+        const session = connectJson(authority, (message) => received.push(message), () => undefined, { subject: "bob", grant });
+        session.receive(JSON.stringify({ type: "hello", namespace: "alice.notes", revision: 0, clientId: "b", protocol: 4 }));
         const change = (id: string, path: string) => session.receive(JSON.stringify({ type: "change", change: { id, path, op: "set", value: "x", base: 0 } }));
 
         // Act

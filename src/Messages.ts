@@ -1,16 +1,14 @@
 import type { Change, JsonValue, RevisedChange } from "./Change.js";
 
 /**
- * The version of the sync protocol a client sends in hello: 2 adds the durable watermark and ephemeral changes, 3
- * requests (docs/design/statenet-requests.md)
+ * The version of the sync protocol a client sends in hello. Protocol 4 is binary after hello
+ * (docs/design/statenet-wire-format.md, `createSyncWire`); it has the durable watermark, ephemeral changes and requests
+ * (docs/design/statenet-requests.md) of the text protocols it replaced
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
-/**
- * The versions an authority speaks; a version 1 client gets neither durable messages nor a welcome's durable, and a
- * client below 3 is sent no request: a change of its that would be one is rejected with `access`
- */
-export const PROTOCOL_VERSIONS: readonly number[] = [1, 2, 3];
+/** The versions an authority speaks: a hello of another is `invalid-message` */
+export const PROTOCOL_VERSIONS: readonly number[] = [PROTOCOL_VERSION];
 
 /** A client opens a connection: the namespace it syncs and the revision its state is at (0 for none) */
 export interface HelloMessage {
@@ -20,7 +18,7 @@ export interface HelloMessage {
     clientId: string;
     protocol: number;
     /**
-     * Protocol 3: the session follows requests only: its welcome carries the requests and no changes, and it gets
+     * The session follows requests only: its welcome carries the requests and no changes, and it gets
      * `requested` and `decided` but no `changes` or `durable`. A relay that serves a namespace's state from its
      * cache opens one to the owner for a browser's requests
      */
@@ -37,9 +35,9 @@ export interface WelcomeMessage {
     revision: number;
     changes?: RevisedChange[];
     snapshot?: JsonValue;
-    /** Protocol 2: how far the namespace is durable, so changes up to it are committed */
+    /** How far the namespace is durable, so changes up to it are committed */
     durable?: number;
-    /** Protocol 3: the requests the client sent, and those it may decide (empty when there are none) */
+    /** The requests the client sent, and those it may decide (empty when there are none) */
     requests?: SyncRequest[];
 }
 
@@ -50,7 +48,7 @@ export interface ChangesMessage {
 }
 
 /**
- * Protocol 2: everything up to `revision` is durable (stored where it survives the authority), so a listener marks
+ * Everything up to `revision` is durable (stored where it survives the authority), so a listener marks
  * the changes up to it committed; the ones after it are pending
  */
 export interface DurableMessage {
@@ -71,7 +69,7 @@ export type AckResult = "applied" | "adjusted" | "rejected" | "requested";
  * - applied: the change is in at revision
  * - adjusted: server logic changed it; value is what the path holds at revision
  * - rejected: the change is not in; reason says why, and code what kind of refusal it is
- * - requested (protocol 3): the change is not in; it waits as a request of the same id for someone to decide it
+ * - requested: the change is not in; it waits as a request of the same id for someone to decide it
  */
 export interface AckMessage {
     type: "ack";
@@ -127,13 +125,13 @@ export interface SyncRequest {
     note?: string;
 }
 
-/** Protocol 3: a new request, to its requester and to each client that may decide it */
+/** A new request, to its requester and to each client that may decide it */
 export interface RequestedMessage {
     type: "requested";
     request: SyncRequest;
 }
 
-/** Protocol 3: a request was decided, to its requester and to each client that may decide it */
+/** A request was decided, to its requester and to each client that may decide it */
 export interface DecidedMessage {
     type: "decided";
     id: string;
@@ -143,20 +141,20 @@ export interface DecidedMessage {
     note?: string;
 }
 
-/** Protocol 3: a client that may decide a request approves it */
+/** A client that may decide a request approves it */
 export interface ApproveMessage {
     type: "approve";
     id: string;
 }
 
-/** Protocol 3: a client that may decide a request rejects it, with a note for the requester */
+/** A client that may decide a request rejects it, with a note for the requester */
 export interface RejectMessage {
     type: "reject";
     id: string;
     note?: string;
 }
 
-/** Protocol 3: the requester takes a pending request back */
+/** The requester takes a pending request back */
 export interface WithdrawMessage {
     type: "withdraw";
     id: string;

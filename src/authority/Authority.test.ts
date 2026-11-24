@@ -1,3 +1,4 @@
+import { connectJson } from "../__fixtures__/Wired.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
@@ -19,7 +20,7 @@ const STATE = Object.freeze({
     data: Object.freeze({ total: 10, items: Object.freeze([]) as unknown as never[] })
 });
 
-const hello = (revision = 0, namespace = NAMESPACE) => JSON.stringify({ type: "hello", namespace, revision, clientId: "c", protocol: 1 });
+const hello = (revision = 0, namespace = NAMESPACE) => JSON.stringify({ type: "hello", namespace, revision, clientId: "c", protocol: 4 });
 
 let counter = 0;
 const change = (path: string, value: unknown, op: Change["op"] = "set", id = `id-${++counter}`) =>
@@ -32,7 +33,7 @@ const setup = async (options: Partial<AuthorityOptions> = {}) => {
     const join = (revision?: number) => {
         const received: SyncMessage[] = [];
         const close = vi.fn();
-        const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close });
+        const session = connectJson(authority, (message) => received.push(message), close);
         if (revision !== undefined) {
             session.receive(hello(revision));
         }
@@ -52,7 +53,7 @@ describe("createAuthority", () => {
 
             const { received } = join(0);
 
-            expect(received).toEqual([{ type: "welcome", namespace: NAMESPACE, revision: 0, snapshot: STATE }]);
+            expect(received).toEqual([{ type: "welcome", namespace: NAMESPACE, revision: 0, snapshot: STATE, durable: 0, requests: [] }]);
         });
 
         it("should answer a client in the log with the changes after its revision", async () => {
@@ -63,12 +64,14 @@ describe("createAuthority", () => {
 
             const { received } = join(1);
 
-            expect(received).toEqual([{
+            expect(received[0]).toEqual({
                 type: "welcome",
                 namespace: NAMESPACE,
                 revision: 2,
-                changes: [{ id: "b", path: "$.app.page", op: "set", value: 2, base: 0, revision: 2 }]
-            }]);
+                changes: [{ id: "b", path: "$.app.page", op: "set", value: 2, base: 0, revision: 2 }],
+                durable: 0,
+                requests: []
+            });
         });
 
         it("should answer a client at the current revision with no changes", async () => {
@@ -77,7 +80,7 @@ describe("createAuthority", () => {
 
             const { received } = join(1);
 
-            expect(received).toEqual([{ type: "welcome", namespace: NAMESPACE, revision: 1, changes: [] }]);
+            expect(received[0]).toEqual({ type: "welcome", namespace: NAMESPACE, revision: 1, changes: [], durable: 0, requests: [] });
         });
 
         it("should send a snapshot to a client behind the log", async () => {
@@ -90,7 +93,7 @@ describe("createAuthority", () => {
             const behind = join(1);
             const inLog = join(2);
 
-            expect(behind.received).toEqual([{ type: "welcome", namespace: NAMESPACE, revision: 4, snapshot: { ...STATE, data: { ...STATE.data, total: 14 } } }]);
+            expect(behind.received[0]).toEqual({ type: "welcome", namespace: NAMESPACE, revision: 4, snapshot: { ...STATE, data: { ...STATE.data, total: 14 } }, durable: 0, requests: [] });
             expect(inLog.received[0]).toMatchObject({ revision: 4, changes: [{ revision: 3 }, { revision: 4 }] });
         });
 
@@ -132,7 +135,7 @@ describe("createAuthority", () => {
             const { join } = await setup();
             const old = join();
 
-            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 4 }));
+            old.session.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "c", protocol: 3 }));
             old.session.receive(change("$.data.total", 1));
 
             expect(old.received.map((message) => message.type === "error" && message.code)).toEqual(["invalid-message", "no-hello"]);
@@ -318,8 +321,8 @@ describe("createAuthority", () => {
                 applied: [{ id: "x", revision: 1 }, { id: "y", revision: 2 }]
             });
             expect(second.authority.state()).toMatchObject({ data: { total: 2 } });
-            expect(client.received).toEqual([
-                { type: "welcome", namespace: NAMESPACE, revision: 2, changes: [{ id: "y", path: "$.data.total", op: "set", value: 2, base: 0, revision: 2 }] },
+            expect(client.received.filter((message) => message.type !== "durable")).toEqual([
+                { type: "welcome", namespace: NAMESPACE, revision: 2, changes: [{ id: "y", path: "$.data.total", op: "set", value: 2, base: 0, revision: 2 }], durable: 2, requests: [] },
                 { type: "ack", id: "x", result: "applied", revision: 1 }
             ]);
         });
@@ -496,15 +499,14 @@ describe("createAuthority: durability", () => {
             await new Promise((resolve) => setTimeout(resolve, 0));
         }, saves: () => saves };
     };
-    const hello2 = (revision = 0) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision, clientId: "c2", protocol: 2 });
+    const hello2 = (revision = 0) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision, clientId: "c2", protocol: 4 });
 
-    it("should tell a protocol 2 client how far the namespace is durable, in its welcome and as each save lands", async () => {
+    it("should tell a client how far the namespace is durable, in its welcome and as each save lands", async () => {
         // Arrange
         const slow = slowStorage();
         const { authority, join } = await setup({ storage: slow.storage });
         const watcher = join();
         watcher.session.receive(hello2());
-        const old = join(0);
 
         // Act
         join(0).session.receive(change("$.data.total", 11, "set", "a"));
@@ -517,7 +519,6 @@ describe("createAuthority: durability", () => {
         expect(before).toBe(0);
         expect(authority.durable()).toBe(1);
         expect(watcher.received.at(-1)).toEqual({ type: "durable", revision: 1 });
-        expect(old.received.some((message) => message.type === "durable")).toBe(false);
     });
 
     it("should resolve a wait for durability once the save of that revision lands", async () => {
@@ -539,14 +540,13 @@ describe("createAuthority: durability", () => {
         expect(done).toBe(true);
     });
 
-    it("should never save an ephemeral path, push it marked to protocol 2 clients only, and not hold up the watermark", async () => {
+    it("should never save an ephemeral path, push it marked, and not hold up the watermark", async () => {
         // Arrange
         const slow = slowStorage();
         const { authority, join } = await setup({ storage: slow.storage, ephemeral: ["$.app.pointer"], initial: { app: { pointer: { x: 0 } }, data: { total: 10 } } });
         const writer = join(0);
         const watcher = join();
         watcher.session.receive(hello2());
-        const old = join(0);
 
         // Act: a second of pointer moves at 60 a second
         for (let index = 1; index <= 60; index++) writer.session.receive(change("$.app.pointer.x", index));
@@ -566,7 +566,6 @@ describe("createAuthority: durability", () => {
         expect(stored?.log.map((logged) => logged.path)).toEqual(["$.data.total"]);
         const pushed = (received: SyncMessage[]) => received.flatMap((message) => (message.type === "changes" ? message.changes : []));
         expect(pushed(watcher.received)[0]).toMatchObject({ path: "$.app.pointer.x", ephemeral: true });
-        expect(pushed(old.received)[0]).not.toHaveProperty("ephemeral");
     });
 });
 

@@ -67,7 +67,7 @@ describe("reporting", () => {
         const authorityReports = messagesOf(heard, "state-sync.authority");
         expect(authorityReports.some((message) => /^Loaded apps\.orders at revision 0 from the initial state in [\d.]+ ms, 0 changes logged$/.test(message))).toBe(true);
         expect(authorityReports).toContain(`A client connected to ${NAMESPACE}: 2 connections`);
-        expect(authorityReports).toContain(`Welcomed client writer to ${NAMESPACE} at revision 0 with a snapshot (protocol 3)`);
+        expect(authorityReports).toContain(`Welcomed client writer to ${NAMESPACE} at revision 0 with a snapshot`);
         expect(authorityReports).toContain(`Applied the set of client writer at $.data.card in ${NAMESPACE} at revision 1`);
         expect(authorityReports.some((message) => /^Saved apps\.orders at revision 1 in [\d.]+ ms$/.test(message))).toBe(true);
         expect(authorityReports).toContain(`Closed ${NAMESPACE} at revision 1 with 0 connections`);

@@ -1,13 +1,15 @@
 /**
- * The wire's size and speed, JSON text against CBOR (docs/design/statenet-wire-format.md). It builds a session the way
+ * The wire's size and speed: JSON text, plain CBOR of the same objects, and protocol 4 (`createSyncWire`: arrays, path
+ * numbers, uuids as bytes) (docs/design/statenet-wire-format.md). It builds a session the way
  * the example app's Northwind data makes one: a welcome whose snapshot holds 300 orders with their lines and customers,
  * then 1,000 `changes` messages of one record change each (a status, a quantity, a new order, a delete). It prints the
- * bytes of each encoding and the time to encode and decode them all, the best of several runs.
+ * bytes of each encoding and the time to encode and decode them all, the best of several runs. Protocol 4's decode
+ * includes checking each message, as a connection does; JSON's and CBOR's do not.
  *
  * Run from state-sync after a build: `node scripts/wire-size.ts`
  */
-import { decodeCbor, encodeCbor } from "../dist/index.js";
-import type { JsonValue } from "../dist/index.js";
+import { createSyncWire, decodeCbor, encodeCbor } from "../dist/index.js";
+import type { JsonValue, SyncMessage } from "../dist/index.js";
 
 type Message = { [key: string]: JsonValue };
 
@@ -89,19 +91,27 @@ const binaries = messages.map((message) => encodeCbor(message));
 const sizeOf = (sizes: number[]) => ({ welcome: sizes[0] as number, changes: sizes.slice(1).reduce((sum, size) => sum + size, 0) });
 const json = sizeOf(texts.map((text) => utf8.encode(text).length));
 const cbor = sizeOf(binaries.map((bytes) => bytes.length));
+const writeAll = () => { const wire = createSyncWire(); return messages.map((message) => wire.write(message as unknown as SyncMessage) as Uint8Array); };
+const wired = writeAll();
+const wire = sizeOf(wired.map((bytes) => bytes.length));
 
 const timing = {
     jsonEncode: best(() => { for (const message of messages) utf8.encode(JSON.stringify(message)); }),
     jsonDecode: best(() => { for (const text of texts) JSON.parse(text); }),
     cborEncode: best(() => { for (const message of messages) encodeCbor(message); }),
-    cborDecode: best(() => { for (const bytes of binaries) decodeCbor(bytes); })
+    cborDecode: best(() => { for (const bytes of binaries) decodeCbor(bytes); }),
+    wireEncode: best(() => { writeAll(); }),
+    wireDecode: best(() => {
+        const reader = createSyncWire();
+        for (const bytes of wired) if (!reader.read(bytes).ok) throw new Error("protocol 4 refused its own message");
+    })
 };
 
 const percent = (part: number, whole: number): string => `${Math.round((part / whole) * 100)}%`;
 const ms = (value: number): string => `${value.toFixed(1)} ms`;
 console.log(`Session: a welcome of 300 orders, then 1,000 changes messages (best of ${RUNS} runs)`);
-console.log(`              JSON bytes   CBOR bytes   CBOR/JSON`);
-console.log(`welcome     ${String(json.welcome).padStart(12)} ${String(cbor.welcome).padStart(12)}   ${percent(cbor.welcome, json.welcome)}`);
-console.log(`changes     ${String(json.changes).padStart(12)} ${String(cbor.changes).padStart(12)}   ${percent(cbor.changes, json.changes)}`);
-console.log(`encode      ${ms(timing.jsonEncode).padStart(12)} ${ms(timing.cborEncode).padStart(12)}`);
-console.log(`decode      ${ms(timing.jsonDecode).padStart(12)} ${ms(timing.cborDecode).padStart(12)}`);
+console.log(`              JSON bytes   CBOR bytes   CBOR/JSON   protocol 4   p4/JSON`);
+console.log(`welcome     ${String(json.welcome).padStart(12)} ${String(cbor.welcome).padStart(12)}   ${percent(cbor.welcome, json.welcome).padStart(9)} ${String(wire.welcome).padStart(12)}   ${percent(wire.welcome, json.welcome).padStart(7)}`);
+console.log(`changes     ${String(json.changes).padStart(12)} ${String(cbor.changes).padStart(12)}   ${percent(cbor.changes, json.changes).padStart(9)} ${String(wire.changes).padStart(12)}   ${percent(wire.changes, json.changes).padStart(7)}`);
+console.log(`encode      ${ms(timing.jsonEncode).padStart(12)} ${ms(timing.cborEncode).padStart(12)}   ${"".padStart(9)} ${ms(timing.wireEncode).padStart(12)}`);
+console.log(`decode      ${ms(timing.jsonDecode).padStart(12)} ${ms(timing.cborDecode).padStart(12)}   ${"".padStart(9)} ${ms(timing.wireDecode).padStart(12)}`);

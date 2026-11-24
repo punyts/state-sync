@@ -1,3 +1,4 @@
+import { connectJson } from "../__fixtures__/Wired.js";
 import { describe, expect, it } from "vitest";
 import { createStore } from "@punyts/state";
 import { createStoreBridge } from "../Bridge.js";
@@ -28,7 +29,7 @@ const keys = () => {
 const grantOf = (privateKey: string, rights: GrantRight[], claims: Partial<GrantClaims> = {}) =>
     signGrant({ kid: "alice-1", issuer: "alice", subject: "bob", owner: "alice", pattern: "$.apps.notes.data", rights, issued: START, expires: START + 30 * DAY, ...claims }, privateKey);
 
-const hello = (protocol = 3) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: `client-${protocol}`, protocol });
+const hello = (clientId: string) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId, protocol: 4 });
 const change = (id: string, path: string, value: unknown, base = 0) => JSON.stringify({ type: "change", change: { id, path, op: "set", value, base } });
 
 /** Alice's authority with access checked, a clock, and sessions that record what they are sent */
@@ -44,10 +45,10 @@ const setup = async (options: Partial<AuthorityOptions> = {}, storage: Namespace
         ...options,
         requests: { now: () => clock.now, ...options.requests }
     });
-    const join = (subject: string, grant?: string, protocol = 3) => {
+    const join = (subject: string, grant?: string) => {
         const received: SyncMessage[] = [];
-        const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, grant === undefined ? { subject } : { subject, grant });
-        session.receive(hello(protocol));
+        const session = connectJson(authority, (message) => received.push(message), () => undefined, grant === undefined ? { subject } : { subject, grant });
+        session.receive(hello(`client-${subject}`));
         const of = <T extends SyncMessage["type"]>(type: T) => received.filter((message): message is Extract<SyncMessage, { type: T }> => message.type === type);
         return { received, session, of };
     };
@@ -61,10 +62,10 @@ describe("requests", () => {
         const bob = join("bob", grantOf(alice.privateKey, ["read", "request"]));
         bob.session.receive(change("r1", "$.data.notes.n1", "Hello"));
         const received: SyncMessage[] = [];
-        const tunnel = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, { subject: "bob", grant: grantOf(alice.privateKey, ["read", "request"]) });
+        const tunnel = connectJson(authority, (message) => received.push(message), () => undefined, { subject: "bob", grant: grantOf(alice.privateKey, ["read", "request"]) });
 
         // Act
-        tunnel.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "relay-1", protocol: 3, requests: true }));
+        tunnel.receive(JSON.stringify({ type: "hello", namespace: NAMESPACE, revision: 0, clientId: "relay-1", protocol: 4, requests: true }));
         authority.write({ path: "$.data.notes.n2", op: "set", value: "Owner" });
         await authority.flush();
         bob.session.receive(JSON.stringify({ type: "withdraw", id: "r1" }));
@@ -93,18 +94,15 @@ describe("requests", () => {
         expect(authority.revision()).toBe(0);
     });
 
-    it("should reject a change that would be a request from a protocol 2 client, and one from someone who may not request", async () => {
+    it("should reject a change from someone who may not request", async () => {
         // Arrange
         const { alice, join } = await setup();
-        const old = join("bob", grantOf(alice.privateKey, ["request"]), 2);
         const reader = join("carol", grantOf(alice.privateKey, ["read"], { subject: "carol" }));
 
         // Act
-        old.session.receive(change("r1", "$.data.notes.n1", "Hello"));
         reader.session.receive(change("r2", "$.data.notes.n1", "Hello"));
 
         // Assert
-        expect(old.of("ack")).toMatchObject([{ id: "r1", result: "rejected", code: "access" }]);
         expect(reader.of("ack")).toMatchObject([{ id: "r2", result: "rejected", code: "access" }]);
     });
 
@@ -126,7 +124,7 @@ describe("requests", () => {
 
         // Assert
         expect(authority.get("$.data.notes.n1")).toBe("Hello");
-        expect(contexts[1]).toEqual({ clientId: "client-3", stale: true, request: { by: "bob", at: START, approvedBy: "alice" } });
+        expect(contexts[1]).toEqual({ clientId: "client-bob", stale: true, request: { by: "bob", at: START, approvedBy: "alice" } });
         expect(bob.of("changes").flatMap((message) => message.changes).map((each) => each.id)).toEqual(["w1", "r1"]);
         expect(bob.of("decided")).toEqual([{ type: "decided", id: "r1", status: "approved", decidedAt: START }]);
         expect(owner.of("decided")).toEqual([{ type: "decided", id: "r1", status: "approved", decidedAt: START }]);
@@ -268,8 +266,8 @@ describe("requests", () => {
         const second = await createAuthority({ namespace: NAMESPACE, storage, initial: {}, access: { address: ADDRESS, context: () => ({ keyOf: (kid) => (kid === "alice-1" ? { ownerId: "alice", publicKey: first.alice.publicKey } : undefined), now: START }) }, requests: { now: () => START } });
         const welcomes = ["bob", "alice"].map((subject) => {
             const received: SyncMessage[] = [];
-            const session = second.connect({ send: (text) => received.push(JSON.parse(text)), close: () => undefined }, subject === "bob" ? { subject, grant } : { subject });
-            session.receive(hello());
+            const session = connectJson(second, (message) => received.push(message), () => undefined, subject === "bob" ? { subject, grant } : { subject });
+            session.receive(hello(`client-${subject}`));
             return received[0];
         });
 

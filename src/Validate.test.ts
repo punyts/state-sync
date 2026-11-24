@@ -5,7 +5,7 @@ const CHANGE = Object.freeze({ id: "c1", path: "$.data.total", op: "set", value:
 const REVISED = Object.freeze({ ...CHANGE, revision: 4 });
 
 const VALID = Object.freeze({
-    hello: { type: "hello", namespace: "apps.orders", revision: 0, clientId: "tab-1", protocol: 1 },
+    hello: { type: "hello", namespace: "apps.orders", revision: 0, clientId: "tab-1", protocol: 4 },
     welcomeChanges: { type: "welcome", namespace: "apps.orders", revision: 4, changes: [REVISED] },
     welcomeSnapshot: { type: "welcome", namespace: "apps.orders", revision: 4, snapshot: { data: { total: 12 } } },
     changes: { type: "changes", changes: [REVISED] },
@@ -102,7 +102,7 @@ describe("parseMessage", () => {
 
     describe("hello", () => {
         it("should refuse another protocol version", () => {
-            expect(refusal({ ...VALID.hello, protocol: 4 }).message).toContain("protocol");
+            expect(refusal({ ...VALID.hello, protocol: 3 }).message).toContain("protocol");
         });
 
         it("should refuse a bad namespace", () => {

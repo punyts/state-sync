@@ -19,6 +19,7 @@ import { SERVER_PATH, isAtOrBelow, isSyncPath } from "./Paths.js";
 import { forgetNamespace, type LocalStore } from "./LocalStore.js";
 import type { SyncTransport, TransportConnection } from "./Transport.js";
 import { parseMessage, type SyncLimits } from "./Validate.js";
+import { createSyncWire, type SyncWire } from "./Wire.js";
 
 /** standalone: no authority, the local store is the authority */
 export type SyncStatus = "standalone" | "connecting" | "online" | "offline";
@@ -28,7 +29,7 @@ export interface SyncStatusReport {
     /** The changes in the outbox: not yet acknowledged by the authority */
     waiting: number;
     /**
-     * This client's changes the authority applied that are not durable yet (protocol 2): shown, but pending until the
+     * This client's changes the authority applied that are not durable yet: shown, but pending until the
      * watermark passes them, when they are committed
      */
     pending: number;
@@ -68,12 +69,12 @@ export interface SyncClientOptions {
     /** The authority refused a change; its path shows the confirmed value again */
     onRejected?: (rejection: SyncRejection) => void;
     /**
-     * The requests the client knows changed (protocol 3, docs/design/statenet-requests.md): its own, sent by changes the
+     * The requests the client knows changed (docs/design/statenet-requests.md): its own, sent by changes the
      * authority keeps for a decision, and those it may decide; each as it is now, the decided ones too
      */
     onRequests?: (requests: readonly SyncRequest[]) => void;
     onEmit?: (name: string, value?: JsonValue) => void;
-    /** The durable watermark moved (protocol 2): every change up to `revision` is committed, with the ids of this client's changes it committed */
+    /** The durable watermark moved: every change up to `revision` is committed, with the ids of this client's changes it committed */
     onDurable?: (revision: number, committed: readonly string[]) => void;
     /**
      * The authority sent the error `revoked`: this client may no longer have the namespace. Before this is called the
@@ -94,9 +95,9 @@ export interface SyncClient {
     state: () => SyncClientState;
     /** Sends a named event to the authority; false when not online */
     emit: (name: string, value?: JsonValue) => boolean;
-    /** How far the namespace is durable, as the authority last said (protocol 2); 0 before it says */
+    /** How far the namespace is durable, as the authority last said; 0 before it says */
     durable: () => number;
-    /** Copies of the requests the client knows (protocol 3), in the order it learned them */
+    /** Copies of the requests the client knows, in the order it learned them */
     requests: () => SyncRequest[];
     /** Approves a request this client may decide; false when not online. The authority answers with `decided` */
     approve: (id: string) => boolean;
@@ -152,6 +153,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     let running = false;
     //the namespace was revoked: the client never runs again
     let revoked = false;
+    let wire: SyncWire | undefined;
     let connection: TransportConnection | undefined;
     //the handlers of a connection act only while it is the current one
     let current: object | undefined;
@@ -292,7 +294,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         return outbox.splice(index, 1)[0];
     };
 
-    const send = (message: SyncMessage) => connection?.send(JSON.stringify(message));
+    const send = (message: SyncMessage) => {
+        if (connection !== undefined && wire !== undefined) connection.send(wire.write(message));
+    };
 
     const sendHello = () => {
         welcomed = false;
@@ -482,8 +486,11 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         reportStatus();
     };
 
-    const receive = (text: string) => {
-        const parsed = parseMessage(text, options.limits);
+    const receive = (data: string | Uint8Array) => {
+        const parsed = wire === undefined ? undefined : wire.read(data);
+        if (parsed === undefined) {
+            return;
+        }
         if (!parsed.ok) {
             report(CATEGORY, "Ignoring a message from the authority: %s", [parsed.error.message]);
             return;
@@ -576,6 +583,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         }
         const token = {};
         current = token;
+        //each connection numbers its paths afresh
+        wire = createSyncWire(options.limits);
         report(CATEGORY, "Connecting to the authority of %s", [namespace]);
         //a reconnect stays offline until the connection opens
         try {
@@ -585,9 +594,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                         sendHello();
                     }
                 },
-                onMessage: (text) => {
+                onMessage: (data) => {
                     if (current === token) {
-                        receive(text);
+                        receive(data);
                     }
                 },
                 onClose: () => {

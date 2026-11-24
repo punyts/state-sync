@@ -1,3 +1,4 @@
+import { connectJson } from "../__fixtures__/Wired.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
@@ -21,7 +22,7 @@ const STATE = Object.freeze({
     server: Object.freeze({ apiKey: "secret-key" })
 });
 
-const hello = (revision = 0) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision, clientId: "tab-1", protocol: 1 });
+const hello = (revision = 0) => JSON.stringify({ type: "hello", namespace: NAMESPACE, revision, clientId: "tab-1", protocol: 4 });
 
 let counter = 0;
 const change = (path: string, value: unknown, base = 0, op: Change["op"] = "set", id = `id-${++counter}`) =>
@@ -32,7 +33,7 @@ const setup = async (options: Partial<AuthorityOptions> = {}) => {
     const authority = await createAuthority({ namespace: NAMESPACE, storage, initial: copyJson(STATE), serverKey: SERVER_KEY, ...options });
     const join = (revision?: number) => {
         const received: SyncMessage[] = [];
-        const session = authority.connect({ send: (text) => received.push(JSON.parse(text)), close: vi.fn() });
+        const session = connectJson(authority, (message) => received.push(message), vi.fn());
         if (revision !== undefined) {
             session.receive(hello(revision));
         }

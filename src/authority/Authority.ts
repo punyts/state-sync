@@ -2,10 +2,11 @@ import { isReported, report } from "@punyts/core";
 import { createStore, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "../Apply.js";
 import type { Change, JsonValue, RevisedChange } from "../Change.js";
-import { PROTOCOL_VERSION, type AckMessage, type HelloMessage, type RequestErrorCode, type RequestStatus, type SyncMessage, type SyncRequest } from "../Messages.js";
+import { type AckMessage, type HelloMessage, type RequestErrorCode, type RequestStatus, type SyncMessage, type SyncRequest } from "../Messages.js";
 import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
+import { createSyncWire, type SyncWire } from "../Wire.js";
 import { serialOf, type AppliedChange, type NamespaceStorage, type StoredNamespace, type StoredRequest } from "./NamespaceStorage.js";
 import { mayTouch, pathSteps, patternCovers, type PathPattern } from "@punyts/state";
 import { checkAccess, grantPattern, type Access, type AccessAllowed, type GrantContext } from "./Grants.js";
@@ -16,14 +17,15 @@ export type AuthorityErrorCode = "wrong-namespace" | "no-hello";
 
 /** One client connection, as the caller's WebSocket server gives it */
 export interface AuthorityConnection {
-    send: (text: string) => void;
+    /** A message for the client as the sync wire writes it: `hello` and `error` as text, the rest as bytes */
+    send: (data: string | Uint8Array) => void;
     close: () => void;
 }
 
 /** What the caller passes the connection's events to */
 export interface AuthoritySession {
-    /** A message from the client, as text */
-    receive: (text: string) => void;
+    /** A message from the client, as it arrived: text or bytes (`createSyncWire`) */
+    receive: (data: string | Uint8Array) => void;
     /** The connection closed */
     close: () => void;
 }
@@ -68,7 +70,7 @@ export interface AuthorityOptions {
      */
     access?: { address: string; context: () => GrantContext };
     /**
-     * Requests (docs/design/statenet-requests.md), with `access`: a change from a protocol 3 session that may request
+     * Requests (docs/design/statenet-requests.md), with `access`: a change from a session that may request
      * and not write its path waits as a request until the owner, or someone who may read and write the path, decides it
      */
     requests?: RequestOptions;
@@ -143,9 +145,9 @@ export interface Authority {
     connect: (connection: AuthorityConnection, access?: Access) => AuthoritySession;
     /**
      * A change as a session's would be handled, for a caller that orders changes itself (an owner node), answered at
-     * once. `protocol` is the sender's (3 by default): below 3 a change that would be a request is rejected
+     * once
      */
-    submit: (change: Change, from: { clientId: string; access?: Access; protocol?: number }) => Omit<AckMessage, "type">;
+    submit: (change: Change, from: { clientId: string; access?: Access }) => Omit<AckMessage, "type">;
     /** Decides a request as `access` (the owner, someone who may read and write its path, or its requester) */
     decide: (decision: RequestDecision, access?: Access) => DecisionOutcome;
     /** Copies of the requests: pending, and decided ones still kept */
@@ -208,8 +210,8 @@ interface Session {
     /** Answered with welcome; only welcomed sessions get changes */
     welcomed: boolean;
     clientId: string;
-    /** The protocol of its hello: 2 gets the durable watermark */
-    protocol: number;
+    /** The connection's wire: its path numbers both ways */
+    wire: SyncWire;
     /** Its hello asked for requests only: no changes and no watermark */
     requestsOnly?: boolean;
     /** Who the connection is and the grant it presents, for `AuthorityOptions.access` */
@@ -326,14 +328,14 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const closeListeners = new Set<() => void>();
     const durableWaiters: { revision: number; resolve: () => void }[] = [];
 
-    /** Moves the watermark forward, tells the protocol 2 sessions and resolves the waits it passes */
+    /** Moves the watermark forward, tells the sessions and resolves the waits it passes */
     const markDurable = (to: number) => {
         if (to <= durableRevision) {
             return;
         }
         durableRevision = to;
         for (const session of sessions) {
-            if (session.welcomed && session.protocol >= 2 && session.requestsOnly !== true) {
+            if (session.welcomed && session.requestsOnly !== true) {
                 send(session, { type: "durable", revision: to });
             }
         }
@@ -457,7 +459,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
 
     const send = (session: Session, message: SyncMessage) => {
         try {
-            session.connection.send(JSON.stringify(message));
+            session.connection.send(session.wire.write(message));
         }
         catch (error) {
             report(CATEGORY, "Could not send a %s message in %s: %s", [message.type, namespace, errorName(error)]);
@@ -481,14 +483,13 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         const missing = revision - hello.revision;
         //a client at 0 has nothing; one ahead of the authority has a state the authority does not know
         const logged = hello.revision > 0 && missing >= 0 && missing <= log.length && missing <= limits.maxChanges;
-        const durable = hello.protocol >= 2 ? { durable: durableRevision } : {};
+        const durable = { durable: durableRevision };
         const changes = log.slice(log.length - missing);
         session.clientId = hello.clientId;
-        session.protocol = hello.protocol;
         session.requestsOnly = hello.requests === true;
         sweep();
         const context = options.access?.context();
-        const asked = hello.protocol >= 3 ? { requests: [...requests.values()].filter((request) => sees(session, request, context)).map((request) => syncRequest(request, session)) } : {};
+        const asked = { requests: [...requests.values()].filter((request) => sees(session, request, context)).map((request) => syncRequest(request, session)) };
         if (session.requestsOnly) {
             send(session, { type: "welcome", namespace, revision, changes: [], ...asked });
             session.welcomed = true;
@@ -496,10 +497,10 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         send(session, logged
-            ? { type: "welcome", namespace, revision, changes: hello.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change), ...durable, ...asked }
+            ? { type: "welcome", namespace, revision, changes, ...durable, ...asked }
             : { type: "welcome", namespace, revision, snapshot: syncSnapshot(store), ...durable, ...asked });
         session.welcomed = true;
-        report(CATEGORY, "Welcomed client %s to %s at revision %s with %s (protocol %s)", [hello.clientId, namespace, revision, logged ? `${changes.length} changes since ${hello.revision}` : "a snapshot", hello.protocol]);
+        report(CATEGORY, "Welcomed client %s to %s at revision %s with %s", [hello.clientId, namespace, revision, logged ? `${changes.length} changes since ${hello.revision}` : "a snapshot"]);
     };
 
     const ack = (session: Session, message: Omit<AckMessage, "type">) => {
@@ -522,9 +523,9 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
 
     const isMine = (session: Session, request: StoredRequest) => session.access !== undefined && session.access.subject === request.by;
 
-    /** Whether a session is told of a request: a protocol 3 session of its requester, or of someone who may decide it while it is pending */
+    /** Whether a session is told of a request: a session of its requester, or of someone who may decide it while it is pending */
     const sees = (session: Session, request: StoredRequest, context: GrantContext | undefined): boolean =>
-        session.protocol >= 3 && (isMine(session, request) || (request.status === "pending" && mayDecide(session.access, request.change.path, context)));
+        isMine(session, request) || (request.status === "pending" && mayDecide(session.access, request.change.path, context));
 
     /** A request as a session is sent it */
     const syncRequest = (request: StoredRequest, session: Session): SyncRequest => {
@@ -702,7 +703,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
         for (const other of sessions) {
             if (other !== writer && other.welcomed && other.requestsOnly !== true) {
-                send(other, { type: "changes", changes: other.protocol >= 2 ? changes : changes.map(({ ephemeral: _ephemeral, ...change }) => change) });
+                send(other, { type: "changes", changes });
             }
         }
     };
@@ -831,8 +832,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         if (options.access !== undefined) {
             const context = options.access.context();
             const allowed = checkAccess(session.access, { address: options.access.address, path: received.path, right: "write" }, context);
-            //without write, a protocol 3 session that may request the path asks for the change
-            const asking = allowed.ok || session.protocol < 3 || session.access === undefined
+            //without write, a session that may request the path asks for the change
+            const asking = allowed.ok || session.access === undefined
                 ? undefined
                 : checkAccess(session.access, { address: options.access.address, path: received.path, right: "request" }, context);
             if (asking?.ok === true) {
@@ -882,11 +883,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         }
     };
 
-    const receive = (session: Session, text: string) => {
+    const receive = (session: Session, data: string | Uint8Array) => {
         if (!sessions.has(session)) {
             return;
         }
-        const parsed = parseMessage(text, limits);
+        const parsed = session.wire.read(data);
         if (!parsed.ok) {
             report(CATEGORY, "Refused a message from client %s of %s: %s", [session.clientId, namespace, parsed.error.code]);
             send(session, parsed.error);
@@ -949,7 +950,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 connection: { send: () => undefined, close: () => undefined },
                 welcomed: true,
                 clientId: from.clientId,
-                protocol: from.protocol ?? PROTOCOL_VERSION,
+                wire: createSyncWire(limits),
                 ...(from.access === undefined ? {} : { access: from.access }),
                 answer: (given) => {
                     answer = given;
@@ -961,11 +962,11 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
         decide: (decision, access) => decide(decision, access),
         requests: () => copyJson<StoredRequest[]>([...requests.values()]),
         connect: (connection, access) => {
-            const session: Session = { connection, welcomed: false, clientId: "", protocol: 1, ...(access === undefined ? {} : { access }) };
+            const session: Session = { connection, welcomed: false, clientId: "", wire: createSyncWire(limits), ...(access === undefined ? {} : { access }) };
             sessions.add(session);
             report(CATEGORY, "A client connected to %s: %s connections", [namespace, sessions.size]);
             return {
-                receive: (text) => receive(session, text),
+                receive: (data) => receive(session, data),
                 close: () => {
                     if (sessions.delete(session)) {
                         report(CATEGORY, "Client %s left %s: %s connections", [session.clientId, namespace, sessions.size]);

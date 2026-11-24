@@ -11,3 +11,4 @@ export * from "./Client.js";
 export * from "./LocalStore.js";
 export * from "./RandomId.js";
 export * from "./Cbor.js";
+export * from "./Wire.js";

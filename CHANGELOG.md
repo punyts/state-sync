@@ -1,6 +1,22 @@
 # Changelog
 
 ## Unreleased
+- **Sync protocol 4: binary after hello** (docs/design/statenet-wire-format.md, W2). Breaking: `PROTOCOL_VERSION` is 4
+  and `PROTOCOL_VERSIONS` `[4]`; a hello of 1 to 3 is `invalid-message`. `createSyncWire(limits?)` (`src/Wire.ts`) is
+  one connection's side: `hello` and `error` stay JSON text, every other message is a CBOR array `[code, …fields]`
+  with no field names, ops, results, statuses and codes as indexes into their closed lists, paths numbered per side of
+  the connection the first time they go (`[n, path]`, then `n`; text past `MAX_WIRE_PATHS`, 4,096), and uuid ids as 16
+  bytes. A decoded message passes the same checks as a parsed one (`validateMessage`, new). Breaking: `SyncTransport`,
+  `TransportConnection`, `AuthorityConnection` and `AuthoritySession` carry `string | Uint8Array`; the client and each
+  authority session read and write through a wire. Breaking: every session gets `durable`, `requests` and ephemeral
+  changes, as protocol 3 did; `Authority.submit` lost `protocol`, and the welcome report no longer names one.
+  `wireTypeOf(data)` names a binary message's type from its first two bytes, for relays. On the session of
+  `node scripts/wire-size.ts` (best of 7 runs on the tower): welcome JSON 105,717 bytes, protocol 4 88,893 (84%); the
+  1,000 changes messages 209,532 against 88,831 (42%); writing all of them 1.0 ms as JSON text and 3.1 ms through a wire,
+  reading 1.1 ms with `JSON.parse` alone against 5.8 ms through a wire with every message checked. Tests:
+  `src/Wire.test.ts` (every message type both ways, path numbers and the table's end, uuid bytes, the welcome's order,
+  text and binary refusals, a protocol 3 hello refused as `invalid-message`, `wireTypeOf`), and the authority, client
+  and request tests over the wire (`src/__fixtures__/Wired.ts`).
 - **A CBOR codec for the binary wire** (docs/design/statenet-wire-format.md, W1). `encodeCbor` and `decodeCbor`
   (`src/Cbor.ts`, no dependency, browser-safe) carry JSON's values in a subset of CBOR, and byte strings with
   `{ bytes: true }`; decoding refuses anything JSON could not carry and input past `CborLimits` (`DEFAULT_CBOR_LIMITS`)

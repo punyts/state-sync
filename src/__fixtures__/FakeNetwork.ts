@@ -3,11 +3,13 @@ import { applyChange, copyJson } from "../Apply.js";
 import type { Change, JsonValue, RevisedChange } from "../Change.js";
 import type { SyncMessage } from "../Messages.js";
 import type { SyncTransport, TransportConnection, TransportHandlers } from "../Transport.js";
-import { parseMessage } from "../Validate.js";
+import { createSyncWire, type SyncWire } from "../Wire.js";
 
 interface FakeConnection {
     handlers: TransportHandlers;
     open: boolean;
+    /** The authority's side of the connection's wire */
+    wire: SyncWire;
 }
 
 export interface FakeAuthorityOptions {
@@ -49,7 +51,8 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
                 lose = undefined;
                 return;
             }
-            connection.handlers.onMessage(JSON.stringify(message));
+            //written when delivered, so a lost message numbers no path
+            connection.handlers.onMessage(connection.wire.write(message));
         });
     };
 
@@ -106,7 +109,7 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
 
     const transport: SyncTransport = {
         connect: (handlers): TransportConnection => {
-            const connection: FakeConnection = { handlers, open: online };
+            const connection: FakeConnection = { handlers, open: online, wire: createSyncWire() };
             if (online) {
                 connections.add(connection);
                 queue.push(() => connection.open && handlers.onOpen());
@@ -115,11 +118,11 @@ export const createFakeNetwork = (namespace: string, options: FakeAuthorityOptio
                 waiting.add(connection);
             }
             return {
-                send: (text) => {
+                send: (data) => {
                     if (!connection.open) {
                         throw new Error("send on a closed connection");
                     }
-                    const parsed = parseMessage(text);
+                    const parsed = connection.wire.read(data);
                     if (!parsed.ok) {
                         throw new Error(parsed.error.message);
                     }

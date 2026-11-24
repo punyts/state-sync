@@ -43,11 +43,11 @@ interface RevisedChange extends Change { revision: number }   // accepted by the
 
 | type | sent by | fields |
 |---|---|---|
-| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (`PROTOCOL_VERSION`, 3; an authority speaks 1 to 3); protocol 3 may add `requests: true`: the welcome carries the requests and no state, and the session gets `requested` and `decided` only |
-| `welcome` | authority | `namespace`, `revision`, and exactly one of `changes` (since the client's revision) or `snapshot`; protocol 2 adds `durable`, protocol 3 `requests` |
+| `hello` | client | `namespace`, `revision` (0 for none), `clientId`, `protocol` (`PROTOCOL_VERSION`, 4, the only one an authority speaks; another is `invalid-message`); may add `requests: true`: the welcome carries the requests and no state, and the session gets `requested` and `decided` only |
+| `welcome` | authority | `namespace`, `revision`, exactly one of `changes` (since the client's revision) or `snapshot`, `durable` and `requests` |
 | `changes` | authority | `changes`: revised changes from other clients or server logic |
 | `change` | client | `change` |
-| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be; `requested` (protocol 3): kept as a request of the same id |
+| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be; `requested`: kept as a request of the same id |
 | `requested` | authority | `request` (`SyncRequest`): a new request, to its requester and to each client that may decide it |
 | `decided` | authority | `id`, `status` (`approved`, `rejected`, `expired`, `withdrawn`, `revoked`), `decidedAt`, optional `code` and `note` |
 | `approve`, `reject`, `withdraw` | client | `id`; `reject` takes an optional `note`. A decision the authority does not make is an `error`: `no-request`, `not-allowed` or `unsaved` |
@@ -74,6 +74,26 @@ if (!result.ok) {
 `SyncLimits` (defaults in `DEFAULT_SYNC_LIMITS`): `maxMessageSize` 1,000,000; `maxChanges` 1000; `maxDepth` 64;
 `maxPathLength` 1024; `maxIdLength` 128 (change ids, client ids, error codes, emit names); `maxReasonLength` 1024 (ack
 reasons, error messages); `maxNamespaceLength` 256. Pass any of them to override.
+
+### The wire (protocol 4)
+
+`createSyncWire(limits?)` is one connection's side of sync protocol 4 (docs/design/statenet-wire-format.md, W2); each
+end of a connection makes one. `write(message)` gives `hello` and `error` as JSON text and every other message as
+CBOR bytes, sent as a WebSocket binary frame; `read(data)` takes either and returns what `parseMessage` returns, after
+the same checks. Text that is not a `hello` or an `error` is `invalid-message`, so is a binary hello.
+
+- A message is an array `[code, …fields]` in a fixed order, with no field names: welcome 2, changes 3, durable 4,
+  change 5, ack 6, requested 7, decided 8, approve 9, reject 10, withdraw 11, emit 12. Ops, ack results, request
+  statuses and rejection codes go as their index in their closed list; an ephemeral change's op is its index plus 4.
+- A path goes the first time as `[number, path]`, numbered from 0 by the side that sends it, then as the number;
+  past `MAX_WIRE_PATHS` (4,096) a side sends paths as text. The numbers last as long as the connection: a second hello
+  on it keeps them. A number never sent, or a new path out of order, is `invalid-message`.
+- A change, ack or request id that is a lowercase uuid goes as its 16 bytes.
+- `wireTypeOf(data)` gives a binary message's type from its first two bytes without reading it, for a relay that
+  passes emits on or refuses changes without reading paths.
+
+On the session of `scripts/wire-size.ts` (a welcome of 300 orders, then 1,000 one-change `changes` messages) protocol 4
+sends 84% of JSON's bytes for the welcome and 42% for the changes.
 
 ### CBOR
 
@@ -156,7 +176,7 @@ client.start();
   catch-up, or are acked again by id when they are resent.
 - `initial: { state, revision, outbox }` is mounted into the store on `start`, before connecting; `client.state()`
   returns the same shape to keep. `client.emit(name, value)` sends an event when online and returns `false` otherwise.
-- **Requests** (protocol 3, docs/design/statenet-requests.md). A change acked `requested` leaves the outbox and its
+- **Requests** (docs/design/statenet-requests.md). A change acked `requested` leaves the outbox and its
   path shows the confirmed value again, as a rejected one does: the shared state shows only what the owner applied.
   The client keeps the requests the authority tells it of, its own and those it may decide, from `welcome`,
   `requested` and `decided`; `onRequests(requests)` is called with all of them as they are now, and
@@ -191,8 +211,9 @@ import { createAuthority, createMemoryNamespaceStorage } from "@punyts/state-syn
 
 const authority = await createAuthority({ namespace: "apps.orders", storage, initial: { data: {} } });
 wss.on("connection", (socket) => {
-    const session = authority.connect({ send: (text) => socket.send(text), close: () => socket.close() });
-    socket.on("message", (data) => session.receive(String(data)));
+    // what the session sends is a text or a binary frame; what arrives goes to it as it came
+    const session = authority.connect({ send: (data) => socket.send(data), close: () => socket.close() });
+    socket.on("message", (data, isBinary) => session.receive(isBinary ? new Uint8Array(data as Buffer) : String(data)));
     socket.on("close", session.close);
 });
 ```
@@ -209,13 +230,13 @@ wss.on("connection", (socket) => {
   its revision and not applied again. A change at or below `$.server`, or under a parent that does not exist (any op
   but `delete`, unless the authority was made with `createParents: true`), is acked `rejected`. Otherwise the change is applied with `applyChange` at the next revision, in
   arrival order (stale or not), logged, acked `applied`, and pushed as `changes` to every other welcomed connection.
-- **Messages** are handled one at a time in arrival order; every message is checked with `parseMessage`, and a refused
-  one is answered with its `error`.
-- **Requests** (`access` and `requests` options; docs/design/statenet-requests.md). A change from a protocol 3 session
+- **Messages** are handled one at a time in arrival order; each session reads and writes through its own wire
+  (`createSyncWire`), and a refused message is answered with its `error`. `submit(change, { clientId, access })` answers a
+  change that came another way (a relay's forwarded write) as a session's would.
+- **Requests** (`access` and `requests` options; docs/design/statenet-requests.md). A change from a session
   whose access may `request` its path and not `write` it is not applied: it is kept as a pending request (its id is the
   change's), acked `requested`, and sent as `requested` to the requester's sessions and to every session that may
-  decide it: the owner, or someone who may read (not cut) and write the path. A protocol 1 or 2 session gets `access`
-  instead. `approve` runs the change through the change handlers as the requester's, with `stale` from its base and
+  decide it: the owner, or someone who may read (not cut) and write the path. `approve` runs the change through the change handlers as the requester's, with `stale` from its base and
   `request: { by, at, approvedBy }` in the context, and applies it as a server write is pushed; a handler's rejection or
   a missing parent ends it `rejected` with the code `logic` or `invalid`. `reject` ends it with a note, and only its
   requester may `withdraw` it. A request lives `lifeMs` (7 days) and never past the grant that allowed it, ends
@@ -355,5 +376,6 @@ State-sync reports through `@punyts/core`'s reporter and adds no listener; a hos
   `write(path, value)` writes one path (`undefined` deletes), `subscribe(onChanges)` gives the store's own changes.
   `createStoreBridge(store)` is the bridge to a store in the same page; a host page reaches a framed runtime with a
   bridge over messages.
-- `SyncTransport.connect({ onOpen, onMessage, onClose })` returns `{ send, close }`. Messages are text; the client checks
-  every message with `parseMessage` and ignores the ones it refuses. Handlers are called after `connect` returns.
+- `SyncTransport.connect({ onOpen, onMessage, onClose })` returns `{ send, close }`. A message is text or bytes
+  (`string | Uint8Array`), a WebSocket's text or binary frame: a browser socket needs `binaryType = 'arraybuffer'`, and
+  its `ArrayBuffer` goes on as a `Uint8Array`. Each connection gets a new wire; the client ignores what it refuses. Handlers are called after `connect` returns.

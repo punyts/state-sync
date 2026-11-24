@@ -248,8 +248,8 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
             if (!PROTOCOL_VERSIONS.includes(message.protocol as number)) {
                 fail(`protocol must be one of ${PROTOCOL_VERSIONS.join(", ")}`);
             }
-            if ("requests" in message && (message.requests !== true || (message.protocol as number) < 3)) {
-                fail("requests must be true, with protocol 3");
+            if ("requests" in message && message.requests !== true) {
+                fail("requests must be true");
             }
             return;
         case "welcome":
@@ -386,14 +386,23 @@ export const parseMessage = (input: unknown, limits: Partial<SyncLimits> = {}): 
             return refuse("invalid-json", "the message is not JSON");
         }
     }
+    if (typeof input !== "string" && isPlainObject(message) && JSON.stringify(message).length > bounds.maxMessageSize) {
+        return refuse("too-large", `the message is longer than ${bounds.maxMessageSize}`);
+    }
+    return validateMessage(message, bounds);
+};
+
+/**
+ * Checks a message that is already an object, as `parseMessage` does, without measuring it: the sync wire decodes one
+ * from bytes it measured (docs/design/statenet-wire-format.md, W2)
+ */
+export const validateMessage = (message: unknown, limits: Partial<SyncLimits> = {}): ParseResult => {
+    const bounds: SyncLimits = { ...DEFAULT_SYNC_LIMITS, ...limits };
     if (!isPlainObject(message)) {
         return refuse("invalid-message", "the message must be an object");
     }
     try {
         checkMessage(message, bounds);
-        if (typeof input !== "string" && JSON.stringify(message).length > bounds.maxMessageSize) {
-            return refuse("too-large", `the message is longer than ${bounds.maxMessageSize}`);
-        }
     }
     catch (error) {
         if (error instanceof Invalid) {
