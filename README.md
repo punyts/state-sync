@@ -75,6 +75,19 @@ if (!result.ok) {
 `maxPathLength` 1024; `maxIdLength` 128 (change ids, client ids, error codes, emit names); `maxReasonLength` 1024 (ack
 reasons, error messages); `maxNamespaceLength` 256. Pass any of them to override.
 
+### CBOR
+
+`encodeCbor(value, options?)` and `decodeCbor(bytes, options?)` are the binary wire's codec (docs/design/statenet-wire-format.md,
+W1): a subset of CBOR (RFC 8949) that carries what JSON carries. Maps keep their key order, lengths are definite, heads
+are shortest, and a float is a float32 when that holds it exactly. Decoding refuses undefined, tags, other simple
+values, NaN and infinities, keys that are not text, repeated keys and bytes after the value, so what it returns is
+always a `JsonValue`; `__proto__` becomes an own key, as `JSON.parse` makes it. Byte strings (`Uint8Array`) pass only
+with `{ bytes: true }`. `CborLimits` (defaults in `DEFAULT_CBOR_LIMITS`): `maxBytes` 1,000,000, `maxDepth` 64,
+`maxItems` 100,000 values, `maxStringBytes` 1,000,000, each checked before anything is allocated for it. A refusal is a
+`CborError` whose `code` is `too-large`, `too-deep`, `malformed` or `unsupported` and whose message names a byte offset,
+never a value. Strings are UTF-8, so a lone surrogate becomes U+FFFD, as it does when JSON text goes out on a socket.
+`scripts/wire-size.ts` measures a session both ways.
+
 ## Capture
 
 ```ts

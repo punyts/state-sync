@@ -10,3 +10,4 @@ export * from "./Transport.js";
 export * from "./Client.js";
 export * from "./LocalStore.js";
 export * from "./RandomId.js";
+export * from "./Cbor.js";

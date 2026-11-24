@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **A CBOR codec for the binary wire** (docs/design/statenet-wire-format.md, W1). `encodeCbor` and `decodeCbor`
+  (`src/Cbor.ts`, no dependency, browser-safe) carry JSON's values in a subset of CBOR, and byte strings with
+  `{ bytes: true }`; decoding refuses anything JSON could not carry and input past `CborLimits` (`DEFAULT_CBOR_LIMITS`)
+  before allocating for it, with a `CborError` of code `too-large`, `too-deep`, `malformed` or `unsupported`. Nothing
+  sends it yet: sync protocol 4 (W2) does. A session of a welcome of 300 orders and 1,000 one-change `changes` messages (`node scripts/wire-size.ts`, best of 7 runs on the tower): JSON 105,717 and 209,532 bytes, CBOR 88,939 and 173,158 (84% and 83%); encoding 1.0 ms as JSON text (UTF-8 bytes included) and 2.3 ms as CBOR, decoding 1.1 ms and 3.4 ms. Most of the saving is meant to come from W2's arrays, path
+  numbers and byte ids. Tests: `src/Cbor.test.ts` (the RFC 8949 examples, refusals, limits, and 2,000 generated values
+  decoded as `JSON.parse(JSON.stringify(value))` would).
 - **A session can follow requests only: `hello.requests`** (docs/design/statenet-requests.md, follow-ups). A protocol 3 `hello` with `requests: true` is welcomed with its requests and no state (`changes: []`) and then gets `requested` and `decided` but no `changes` or `durable`; `requests` with another protocol is `invalid-message`. A relay that serves state from its cache opens one to the owner for a browser's requests. Test: `src/authority/Requests.test.ts` ("should welcome a session that asked for requests only with its requests, and send it no changes or watermark").
 - **An owner node's plain host names an authority by its address with `/` as `.`** (`alice.notes.user`), as every client of the address says hello, so a session tunnelled to it is not refused as `wrong-namespace`. Storage is by address, so nothing stored moves. Tests: statenet `src/mesh/groups.test.ts`, `ownerMesh.test.ts`, `clientServer.test.ts`.
 - **A request lives as long as its grant's entry says, not its token** (docs/design/statenet-requests.md, R3c). `GrantClaims` gains `requestMs` (a request's life, at most `MAX_REQUEST_MS`, 30 days) and `lasts` (when the entry ends; the token's expiry when absent). `verifyGrant` and `checkAccess` give the smallest of each over the chain (`AccessAllowed.lasts`, `requestMs`; the owner's `lasts` is infinite), a token is refused once `lasts` passes, and the authority ends a request at `min(at + (requestMs ?? lifeMs), lasts)`. Before, a request made with a short-lived token ended with the token. Test: `src/authority/Requests.test.ts` ("should keep a request past its token's expiry for the grant's requestMs, within the entry's lasts").
