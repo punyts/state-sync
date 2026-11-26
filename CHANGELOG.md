@@ -1,14 +1,17 @@
 # Changelog
 
 ## Unreleased
+- **The device's store in IndexedDB** (docs/design/state-definitions-and-instances.md, offline).
+  `openIndexedDbLocalStore(namespaces, options)` opens a `LocalStore` over IndexedDB: it reads the given namespaces'
+  parts when it opens, serves reads from memory and writes through in order; a refused write is reported and goes to
+  `onError`. Fix: the README and this changelog had their own beginning pasted in where a `` `$` `` was meant.
+  Tests: `src/IndexedDbLocalStore.browser.test.ts`.
 - **Undo and redo of a namespace history** (docs/design/state-definitions-and-instances.md, instances).
   `AuthorityOptions.history` keeps that many client changes with what their paths held before; the new client
   messages `undo` and `redo` (wire codes 13 and 14), `SyncClient.undo()`/`redo()` and `Authority.undo()`/`redo()`/
   `history()` step it back and forward as server writes, so no server logic runs. A new change clears what was
   undone; ephemeral and secret changes are never kept; the history is saved with the namespace. With `access`, only a
-  session that may write `# Changelog
-
- may undo. Tests: `src/authority/History.test.ts`, `src/Client.meta.test.ts`,
+  session that may write `$` may undo. Tests: `src/authority/History.test.ts`, `src/Client.meta.test.ts`,
   `src/Wire.test.ts`.
 - **Local and secret paths** (docs/design/state-definitions-and-instances.md, metadata). `SyncClientOptions.local`
   (a node's `@local`): a change at or below one is never sent; it is kept in the local store's new `local` part and
@@ -59,9 +62,7 @@
 - **Reporting by area, never a value.** Breaking: the `state-sync` category is replaced by `state-sync.client` (start, connect, hello, welcome with snapshot or change count, changes queued, sent and applied by path and revision, acks, revision gaps, reconnects with their delay, revoke, stop), `state-sync.capture` (each captured batch by op and path, with the writes folded), `state-sync.authority` (load and save with their duration in ms, connects and leaves, welcomes, each change applied, adjusted or rejected with the kind of refusal, server writes, close), `state-sync.relay` (upstream subscriptions, welcomes, gaps, epochs, listeners joining, leases and grants ending, changes passed on) and `state-sync.ownership` (taking, claiming, handing off, losing and releasing a namespace, forwarded writes). Per-change reports are guarded with `isReported`. Fix: failures report an error's name, not its message (a storage or handler error may hold values), a client's error by its code only, and a handler's rejection by its kind, not its reason. Tests: `src/Reporting.test.ts`.
 - **`FencedError` says what it refused.** It carries `address`, `epoch` (of the refused save) and `current` (the newest epoch the namespace was saved under), so statenet's aggregate can send a fence across the mesh and the node can throw it again.
 - **Owner nodes with a host of their own.** `OwnerNode` takes a `host` (`NamespaceHost`): an app server gives its own authorities (with its logic and storage, fencing its saves by the epoch it is given), and may restart them between writes; plain authorities over `storage` stay the default. `place(address)` says where a namespace is ordered (here, taking it when nobody holds it, or at its owner), `owns` whether it is here; `authorityOf` and `stop` are now async. The nodes an owner reaches are `NodePeer`s (`write`, `claim`, `handoff`), so a peer can be another process over the mesh. `Authority.onClose`; `createAuthorityUpstream` never serves `$.server` and closes its listeners when the authority closes. Tests: `Ownership.test.ts`, `Relay.test.ts`.
-- **Fix: a relay caches a whole namespace.** A subscription to `# Changelog
-
- cached nothing, so its snapshots were empty; a change of the whole namespace now replaces the cache. Test: `Relay.test.ts`.
+- **Fix: a relay caches a whole namespace.** A subscription to `$` cached nothing, so its snapshots were empty; a change of the whole namespace now replaces the cache. Test: `Relay.test.ts`.
 - **Owner nodes and moving ownership.** `OwnerNode` holds the authority of each namespace it owns and passes other writes to the owner; `claim` and `handoff` move a namespace without two writers (the owner stops ordering, waits until it is durable, and hands over its revision, epoch and the writes that came meanwhile), and a namespace whose owner's lease ran out is taken over on the next write. `OwnershipStore` (compare-and-swap on the epoch) and `EpochStorage` (a save from an older epoch is refused with `FencedError`) are ports, with memory versions. `ClaimPolicy` moves ownership only to a node that sends most of the writes, with a cooldown. Relays refuse batches from an older epoch and start over from a snapshot under a newer one. Tests: `Ownership.test.ts`.
 - **Grants.** `signGrant`, `verifyGrant` and `checkAccess`: Ed25519-signed read and write grants for an address and a path prefix, a root signed by the owner of the address and grants passed on, each no wider than the one before (`addressCovers`, `isWithinPrefix`), retired keys verifying only what they signed before, and a `RevocationList`. A relay with `grants` checks every subscription's read on subscribe and each renewal, `revoke` closes the listeners whose read rests on a grant and passes the revocation down; `node` and `trustedNodes` let relays trust the relays below them. An authority with `access` checks every client change against its connection's grant (`connect(connection, access)`). Tests: `Grants.test.ts`.
 - **Relays.** `createRelay(upstream, options)` serves subscriptions to an address and path prefix: one upstream subscription per address and prefix however many listeners ask, a cache of the prefix with its recent changes, catch-up from the cache (the changes since a listener's revision, or a snapshot), leases (`renew`, `sweep`, `leaseMs`), and a new upstream subscription from its own revision when a batch skips one. `createAuthorityUpstream(resolve)` serves an owner's authorities, projecting each change onto the prefix (`projectChange`). `Authority` has `onChanges` (every committed change) and `changesSince`. Tests: `Relay.test.ts`.

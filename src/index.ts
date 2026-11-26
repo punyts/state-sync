@@ -9,6 +9,7 @@ export * from "./Bridge.js";
 export * from "./Transport.js";
 export * from "./Client.js";
 export * from "./LocalStore.js";
+export * from "./IndexedDbLocalStore.js";
 export * from "./RandomId.js";
 export * from "./Cbor.js";
 export * from "./Wire.js";
