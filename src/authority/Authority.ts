@@ -7,7 +7,7 @@ import { SERVER_PATH, isAtOrBelow, isSyncPath } from "../Paths.js";
 import { syncSnapshot } from "../Snapshot.js";
 import { DEFAULT_SYNC_LIMITS, parseMessage, type SyncLimits } from "../Validate.js";
 import { createSyncWire, type SyncWire } from "../Wire.js";
-import { serialOf, type AppliedChange, type NamespaceStorage, type StoredNamespace, type StoredRequest } from "./NamespaceStorage.js";
+import { serialOf, type AppliedChange, type HistoryEntry, type NamespaceStorage, type StoredNamespace, type StoredRequest } from "./NamespaceStorage.js";
 import { mayTouch, pathSteps, patternCovers, type PathPattern } from "@punyts/state";
 import { checkAccess, grantPattern, type Access, type AccessAllowed, type GrantContext } from "./Grants.js";
 import { decryptServerBranch, encryptServerBranch } from "./ServerCrypto.js";
@@ -64,6 +64,14 @@ export interface AuthorityOptions {
      * kept as a request
      */
     secret?: readonly string[];
+    /**
+     * How many client changes are kept to undo (a person's app instance, docs/design/state-definitions-and-instances.md);
+     * 0, the default, keeps none. A client's `undo` writes back what the newest change's path held before it, a `redo`
+     * writes the newest undone change again; both are server writes, so every client gets them as changes and no server
+     * logic runs for them. A new client change clears what was undone. Ephemeral and secret changes are never kept. The
+     * history is saved with the namespace; a change that falls out of it stays in the state
+     */
+    history?: number;
     /**
      * The most changes held that are not saved yet; 10000 by default. While a save does not land (a node with no link to
      * its aggregate), changes are held; past this many a client change is rejected and a server write throws, ephemeral
@@ -208,6 +216,12 @@ export interface Authority {
     state: () => { [key: string]: JsonValue };
     /** Resolves when every pending save is done */
     flush: () => Promise<void>;
+    /** Undoes the newest change of the history, as a client's `undo` does; the revision it wrote, undefined when there was none */
+    undo: () => number | undefined;
+    /** Writes the newest undone change again, as a client's `redo` does; the revision it wrote, undefined when there was none */
+    redo: () => number | undefined;
+    /** Copies of the changes that can be undone, oldest first */
+    history: () => HistoryEntry[];
     /** Closes every connection */
     close: () => void;
 }
@@ -306,6 +320,10 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     const requests = new Map<string, StoredRequest>((stored?.requests ?? []).map((request) => [request.change.id, request]));
     //counts every change to what is saved, so a storage tells a save sent again from a new one
     let serial = stored === undefined ? 0 : serialOf(stored);
+    const historyLength = Math.max(0, options.history ?? 0);
+    const history: HistoryEntry[] = historyLength === 0 ? [] : (stored?.history ?? []).slice(-historyLength);
+    //the changes undone, newest last, which redo writes again; a new client change clears them
+    let undone: HistoryEntry[] = [];
     const requestOptions = options.requests ?? {};
     const lifeMs = requestOptions.lifeMs ?? 7 * DAY_MS;
     const keepMs = requestOptions.keepMs ?? 30 * DAY_MS;
@@ -394,7 +412,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             log: copyJson<RevisedChange[]>(log.filter((logged) => logged.ephemeral !== true)),
             applied: [...applied].map(([id, revision]): AppliedChange => ({ id, revision })),
             serial,
-            ...(requests.size === 0 ? {} : { requests: copyJson<StoredRequest[]>([...requests.values()]) })
+            ...(requests.size === 0 ? {} : { requests: copyJson<StoredRequest[]>([...requests.values()]) }),
+            ...(history.length === 0 ? {} : { history: copyJson<HistoryEntry[]>(history) })
         };
     };
 
@@ -878,8 +897,14 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             ack(session, { id: received.id, result: "rejected", reason: missing, code: "invalid" });
             return;
         }
+        const kept = historyLength > 0 && !isEphemeral(change.path);
+        const before = kept ? (store.get(change.path) as JsonValue | undefined) : undefined;
+        const beforeCopy = before === undefined ? undefined : copyJson<JsonValue>(before);
         const revised = commit(change, session);
         const at = revised.revision;
+        if (kept) {
+            remember({ change: copyJson<RevisedChange>(revised), existed: beforeCopy !== undefined, ...(beforeCopy === undefined ? {} : { before: beforeCopy }) });
+        }
         if (isReported(CATEGORY)) {
             report(CATEGORY, "%s the %s of client %s at %s in %s at revision %s", [adjusted ? "Adjusted" : "Applied", change.op, session.clientId, change.path, namespace, at]);
         }
@@ -889,6 +914,41 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             : { id: change.id, result: "applied", revision: at });
         runApplied(revised, session.clientId);
     };
+
+    /** Adds a client change to the history, which clears what was undone */
+    const remember = (entry: HistoryEntry) => {
+        history.push(entry);
+        if (history.length > historyLength) {
+            history.splice(0, history.length - historyLength);
+        }
+        undone = [];
+    };
+
+    /** Puts a value back at a path, or removes it, as a server write: no server logic runs for it */
+    const rewrite = (path: string, existed: boolean, value: JsonValue | undefined): number | undefined => {
+        if (!existed && store.get(path) === undefined) {
+            return undefined;
+        }
+        return serverWrite(existed ? { path, op: "set", value: copyJson<JsonValue>(value as JsonValue) } : { path, op: "delete" });
+    };
+
+    /** Moves the newest entry of one stack to the other, writing what its path held before; the revision written */
+    const travel = (from: HistoryEntry[], to: HistoryEntry[], verb: string): number | undefined => {
+        const entry = from.pop();
+        if (entry === undefined) {
+            return undefined;
+        }
+        const now = store.get(entry.change.path) as JsonValue | undefined;
+        const at = rewrite(entry.change.path, entry.existed, entry.before);
+        to.push({ change: entry.change, existed: now !== undefined, ...(now === undefined ? {} : { before: copyJson<JsonValue>(now) }) });
+        dirty = true;
+        scheduleSave();
+        report(CATEGORY, "%s the %s at %s in %s", [verb, entry.change.op, entry.change.path, namespace]);
+        return at;
+    };
+
+    const undo = () => travel(history, undone, "Undid");
+    const redo = () => travel(undone, history, "Redid");
 
     const onEmit = (session: Session, name: string, value: JsonValue | undefined) => {
         for (const handler of [...emitHandlers]) {
@@ -941,6 +1001,24 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
                 if (!outcome.ok) {
                     report(CATEGORY, "Refused to %s request %s in %s for client %s: %s", [message.type, message.id, namespace, session.clientId, outcome.code]);
                     send(session, { type: "error", code: outcome.code, message: outcome.reason });
+                }
+                return;
+            }
+            case "undo":
+            case "redo": {
+                if (!session.welcomed) {
+                    refuse(session, "no-hello", "send hello first", false);
+                    return;
+                }
+                if (options.access !== undefined && !checkAccess(session.access, { address: options.access.address, path: "$", right: "write" }, options.access.context()).ok) {
+                    send(session, { type: "error", code: "not-allowed", message: `only someone who may write the whole namespace may ${message.type}` });
+                    return;
+                }
+                if (message.type === "undo") {
+                    undo();
+                }
+                else {
+                    redo();
                 }
                 return;
             }
@@ -1073,6 +1151,9 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             };
         },
         state: () => copyJson(store.get("$")),
+        undo,
+        redo,
+        history: () => copyJson<HistoryEntry[]>(history),
         flush: async () => {
             if (saveScheduled) {
                 //the scheduled save was queued first, so it has joined the chain when this resolves

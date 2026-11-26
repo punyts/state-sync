@@ -122,3 +122,22 @@ describe("createSyncClient with local and secret paths", () => {
         expect(sentPaths(network)).toEqual([]);
     });
 });
+
+describe("createSyncClient undo and redo", () => {
+    it("should ask the authority to undo and redo only while online", async () => {
+        // Arrange
+        const network = createFakeNetwork(NAMESPACE, { state: copyJson(STATE) });
+        const { client } = open({ transport: network.transport });
+        const offlineUndone = client.undo();
+        await network.settle();
+
+        // Act
+        const undone = client.undo();
+        const redone = client.redo();
+        await network.settle();
+
+        // Assert
+        expect([undone, redone, offlineUndone]).toEqual([true, true, false]);
+        expect(network.received.filter((message) => message.type === "undo" || message.type === "redo").map((message) => message.type)).toEqual(["undo", "redo"]);
+    });
+});

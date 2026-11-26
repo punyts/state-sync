@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Undo and redo of a namespace history** (docs/design/state-definitions-and-instances.md, instances).
+  `AuthorityOptions.history` keeps that many client changes with what their paths held before; the new client
+  messages `undo` and `redo` (wire codes 13 and 14), `SyncClient.undo()`/`redo()` and `Authority.undo()`/`redo()`/
+  `history()` step it back and forward as server writes, so no server logic runs. A new change clears what was
+  undone; ephemeral and secret changes are never kept; the history is saved with the namespace. With `access`, only a
+  session that may write `# Changelog
+
+ may undo. Tests: `src/authority/History.test.ts`, `src/Client.meta.test.ts`,
+  `src/Wire.test.ts`.
 - **Local and secret paths** (docs/design/state-definitions-and-instances.md, metadata). `SyncClientOptions.local`
   (a node's `@local`): a change at or below one is never sent; it is kept in the local store's new `local` part and
   laid over the confirmed state and outbox, so it survives a reload on that device. `SyncClientOptions.secret` and

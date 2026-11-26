@@ -50,6 +50,17 @@ export interface StoredNamespace {
     serial?: number;
     /** The requests waiting for a decision, and the decided ones kept for their requesters */
     requests?: StoredRequest[];
+    /** The changes that can be undone, oldest first (`AuthorityOptions.history`) */
+    history?: HistoryEntry[];
+}
+
+/** One change of a namespace's history: the change as committed, and what its path held before it */
+export interface HistoryEntry {
+    change: RevisedChange;
+    /** Whether the path held a value before the change */
+    existed: boolean;
+    /** The value the path held before the change, when it held one */
+    before?: JsonValue;
 }
 
 /** The serial of a stored namespace: its revision when it has none */

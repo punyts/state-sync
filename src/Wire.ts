@@ -15,7 +15,7 @@ import type { ParseResult, SyncLimits } from "./Validate.js";
  * - changes `[3, [revisedChange, …]]`, durable `[4, revision]`, change `[5, change]`
  * - ack `[6, id, result, revision | null, reason | null, code | null, value?]`
  * - requested `[7, request]`, decided `[8, id, status, decidedAt, code | null, note | null]`
- * - approve `[9, id]`, reject `[10, id, note?]`, withdraw `[11, id]`, emit `[12, name, value?]`
+ * - approve `[9, id]`, reject `[10, id, note?]`, withdraw `[11, id]`, emit `[12, name, value?]`, undo `[13]`, redo `[14]`
  * - a change `[id, path, op, base, value?]`; a revised one `[revision, id, path, op, base, value?]`, its op plus 4 when
  *   ephemeral; a request `[id, path, op, base, by, mine, at, until, status, decidedAt | null, code | null, note | null,
  *   value?]`. Ops, results, statuses and codes are their index in their closed list.
@@ -39,7 +39,9 @@ const CODE = {
     approve: 9,
     reject: 10,
     withdraw: 11,
-    emit: 12
+    emit: 12,
+    undo: 13,
+    redo: 14
 } as const;
 
 const ACK_RESULTS: readonly AckResult[] = ["applied", "adjusted", "rejected", "requested", "passed"];
@@ -233,6 +235,9 @@ export function createSyncWire(limits: Partial<SyncLimits> = {}): SyncWire {
                 return [CODE.withdraw, idOut(message.id)];
             case "emit":
                 return message.value === undefined ? [CODE.emit, message.name] : [CODE.emit, message.name, message.value];
+            case "undo":
+            case "redo":
+                return [CODE[message.type]];
         }
     };
 
@@ -298,6 +303,12 @@ export function createSyncWire(limits: Partial<SyncLimits> = {}): SyncWire {
             case CODE.emit: {
                 const [name, ...rest] = arrayOf(fields, "emit", 1, 2);
                 return { type: "emit", name, ...(rest.length === 1 && { value: rest[0] }) };
+            }
+            case CODE.undo:
+            case CODE.redo: {
+                const type = code === CODE.undo ? "undo" : "redo";
+                arrayOf(fields, type, 0, 0);
+                return { type };
             }
             default:
                 return unreadable(typeof code === "number" ? `unknown message code ${code}` : "a message's code must be a number");

@@ -331,6 +331,10 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
                 checkString(message.note, "note", limits.maxReasonLength, true);
             }
             return;
+        case "undo":
+        case "redo":
+            checkKeys(message, message.type, ["type"]);
+            return;
         case "approve":
         case "withdraw":
             checkKeys(message, message.type, ["type", "id"]);

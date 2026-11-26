@@ -122,6 +122,10 @@ export interface SyncClient {
      * are forgotten
      */
     setPaths: (paths: { local?: readonly string[]; secret?: readonly string[] }) => void;
+    /** Asks the authority to undo the newest change of the namespace's history; false when not online */
+    undo: () => boolean;
+    /** Asks the authority to write the newest undone change again; false when not online */
+    redo: () => boolean;
 }
 
 interface OutboxEntry {
@@ -597,6 +601,15 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     };
 
     /** Sends a decision on a request; false when not online */
+    /** Sends undo or redo when online; the result arrives as changes */
+    const travel = (type: "undo" | "redo"): boolean => {
+        if (!welcomed) {
+            return false;
+        }
+        send({ type });
+        return true;
+    };
+
     const decide = (message: SyncMessage & { type: "approve" | "reject" | "withdraw" }): boolean => {
         if (!welcomed) {
             return false;
@@ -807,6 +820,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         approve: (id) => decide({ type: "approve", id }),
         reject: (id, note) => decide(note === undefined ? { type: "reject", id } : { type: "reject", id, note }),
         withdraw: (id) => decide({ type: "withdraw", id }),
+        undo: () => travel("undo"),
+        redo: () => travel("redo"),
         setPaths: (paths) => {
             if (paths.local !== undefined) {
                 localPatterns = patternsOf(paths.local);

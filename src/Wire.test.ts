@@ -34,7 +34,9 @@ const MESSAGES: SyncMessage[] = [
     { type: "reject", id: UUID },
     { type: "withdraw", id: "r1" },
     { type: "emit", name: "pinged", value: { at: 1 } },
-    { type: "emit", name: "pinged" }
+    { type: "emit", name: "pinged" },
+    { type: "undo" },
+    { type: "redo" }
 ];
 
 /** The message without its undefined fields, as JSON would carry it */

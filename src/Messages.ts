@@ -161,6 +161,15 @@ export interface WithdrawMessage {
     id: string;
 }
 
+/**
+ * The client asks the authority to undo the newest change in the namespace's history, or redo the newest undone one
+ * (`AuthorityOptions.history`). The authority writes the result as a server write: every client gets it as a change,
+ * and no server logic runs for it
+ */
+export interface HistoryMessage {
+    type: "undo" | "redo";
+}
+
 /** A named event with an optional value, outside the state (a command, a notice) */
 export interface EmitMessage {
     type: "emit";
@@ -188,7 +197,8 @@ export type SyncMessage =
     | DecidedMessage
     | ApproveMessage
     | RejectMessage
-    | WithdrawMessage;
+    | WithdrawMessage
+    | HistoryMessage;
 
 export type SyncMessageType = SyncMessage["type"];
 
