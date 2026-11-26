@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Local and secret paths** (docs/design/state-definitions-and-instances.md, metadata). `SyncClientOptions.local`
+  (a node's `@local`): a change at or below one is never sent; it is kept in the local store's new `local` part and
+  laid over the confirmed state and outbox, so it survives a reload on that device. `SyncClientOptions.secret` and
+  `AuthorityOptions.secret` (a node's `@secret`): the client sends such a change only while online, drops it while
+  offline and never writes it to the local store or the confirmed state; the authority runs access and server logic
+  on it, hands it to the `onApplied` handlers, and never applies, logs, pushes, saves or keeps it as a request.
+  `SyncClient.setPaths` replaces both lists for a host that learns them from a document. Breaking: the ack result
+  `passed` (wire index 4) answers a secret change, and `WriteOutcome` gains it. Tests: `src/Client.meta.test.ts`,
+  `src/authority/Secret.test.ts`.
 - **`encodeCbor` leaves out undefined members when asked, and writes as deep as it is told** (docs/design/
   statenet-wire-format.md, W3). `CborEncodeOptions` adds `omitUndefined` and `maxDepth`; statenet's mesh protocol 5
   uses both. Fix: the sync wire writes to the depth it reads (`maxDepth` + 4), so a change whose value is at the

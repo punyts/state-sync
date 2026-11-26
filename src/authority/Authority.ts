@@ -58,6 +58,13 @@ export interface AuthorityOptions {
      */
     ephemeral?: readonly string[];
     /**
+     * Secret paths (a node's `@secret`, "$."-prefixed, "*" matching one segment), such as a password field: a client
+     * change at or below one goes through access and server logic like any other, and is then acked as `passed`
+     * and handed to the `onApplied` handlers only. It is never applied to the state, logged, pushed, saved or
+     * kept as a request
+     */
+    secret?: readonly string[];
+    /**
      * The most changes held that are not saved yet; 10000 by default. While a save does not land (a node with no link to
      * its aggregate), changes are held; past this many a client change is rejected and a server write throws, ephemeral
      * changes excepted, until a save lands. A refusal tries a failed save again
@@ -322,6 +329,8 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
     let refusing = false;
     const ephemeral = (options.ephemeral ?? []).map(patternOf);
     const isEphemeral = (path: string) => ephemeral.some((pattern) => patternCovers(pattern, path));
+    const secret = (options.secret ?? []).map(patternOf);
+    const isSecret = (path: string) => secret.some((pattern) => patternCovers(pattern, path));
     //everything up to it is saved or ephemeral; a loaded namespace is durable at the revision it was stored at
     let durableRevision = revision;
     const durableListeners = new Set<(revision: number) => void>();
@@ -836,7 +845,7 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             const asking = allowed.ok || session.access === undefined
                 ? undefined
                 : checkAccess(session.access, { address: options.access.address, path: received.path, right: "request" }, context);
-            if (asking?.ok === true) {
+            if (asking?.ok === true && !isSecret(received.path)) {
                 makeRequest(session, received, asking);
                 return;
             }
@@ -853,6 +862,15 @@ export const createAuthority = async (options: AuthorityOptions): Promise<Author
             return;
         }
         const { change, adjusted } = outcome;
+        if (isSecret(change.path)) {
+            //for server logic only: nothing of it is kept, so the next revision is not taken
+            if (isReported(CATEGORY)) {
+                report(CATEGORY, "Passed the secret %s of client %s at %s in %s to server logic", [change.op, session.clientId, change.path, namespace]);
+            }
+            ack(session, { id: change.id, result: "passed" });
+            runApplied({ ...copyJson<Change>(change), revision }, session.clientId);
+            return;
+        }
         //checked after the handlers: an adjust turns a delete into a set
         const missing = missingParent(change);
         if (missing !== undefined) {

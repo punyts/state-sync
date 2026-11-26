@@ -306,11 +306,11 @@ const checkMessage = (message: Shape, limits: SyncLimits) => {
                     checkCode(message.code, "code");
                 }
             }
-            else if (message.result === "requested") {
-                checkKeys(message, "ack requested", ["type", "id", "result"]);
+            else if (message.result === "requested" || message.result === "passed") {
+                checkKeys(message, `ack ${message.result}`, ["type", "id", "result"]);
             }
             else {
-                fail("result must be one of applied, adjusted, rejected, requested");
+                fail("result must be one of applied, adjusted, rejected, requested, passed");
             }
             return;
         case "requested":

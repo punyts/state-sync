@@ -62,7 +62,7 @@ export interface ChangeMessage {
     change: Change;
 }
 
-export type AckResult = "applied" | "adjusted" | "rejected" | "requested";
+export type AckResult = "applied" | "adjusted" | "rejected" | "requested" | "passed";
 
 /**
  * The authority answers a change:
@@ -70,6 +70,7 @@ export type AckResult = "applied" | "adjusted" | "rejected" | "requested";
  * - adjusted: server logic changed it; value is what the path holds at revision
  * - rejected: the change is not in; reason says why, and code what kind of refusal it is
  * - requested: the change is not in; it waits as a request of the same id for someone to decide it
+ * - passed: the change was at a secret path; server logic had it, and nothing of it is kept or sent on
  */
 export interface AckMessage {
     type: "ack";

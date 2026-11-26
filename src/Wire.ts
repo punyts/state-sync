@@ -42,7 +42,7 @@ const CODE = {
     emit: 12
 } as const;
 
-const ACK_RESULTS: readonly AckResult[] = ["applied", "adjusted", "rejected", "requested"];
+const ACK_RESULTS: readonly AckResult[] = ["applied", "adjusted", "rejected", "requested", "passed"];
 const EPHEMERAL = 4;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 

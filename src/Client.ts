@@ -1,5 +1,5 @@
 import { isReported, report } from "@punyts/core";
-import { createStore, type Store } from "@punyts/state";
+import { compilePattern, createStore, patternCovers, type PathPattern, type Store } from "@punyts/state";
 import { applyChange, copyJson } from "./Apply.js";
 import type { LocalChange, StoreBridge, SyncState } from "./Bridge.js";
 import type { Change, JsonValue } from "./Change.js";
@@ -83,6 +83,17 @@ export interface SyncClientOptions {
      * to clear
      */
     onRevoked?: (message: string) => void;
+    /**
+     * Paths that stay on the device ("$."-prefixed, "*" matching one segment; a node's `@local`): a change at or below
+     * one is never sent. It is kept in the local store's `local` part and laid over the confirmed state and outbox
+     */
+    local?: readonly string[];
+    /**
+     * Paths that go to the authority only (a node's `@secret`): a change at or below one is sent while online and
+     * dropped while offline, never written to the local store and never kept in the confirmed state, so it stays only in
+     * the visible store until the page closes
+     */
+    secret?: readonly string[];
 }
 
 export interface SyncClient {
@@ -105,13 +116,31 @@ export interface SyncClient {
     reject: (id: string, note?: string) => boolean;
     /** Takes back a pending request of this client's; false when not online */
     withdraw: (id: string) => boolean;
+    /**
+     * Replaces the local and secret paths (`SyncClientOptions.local`, `.secret`), for a host that learns them from a
+     * document after the client started; a kind left out stays as it is. Kept local changes no longer at a local path
+     * are forgotten
+     */
+    setPaths: (paths: { local?: readonly string[]; secret?: readonly string[] }) => void;
 }
 
 interface OutboxEntry {
     change: Change;
     /** Sent on the current connection and waiting for its ack */
     sent: boolean;
+    /** At a secret path: never saved, and dropped when the connection closes */
+    secret?: true;
 }
+
+/** Compiles path patterns; a text that is not one throws */
+const patternsOf = (sources: readonly string[] | undefined): PathPattern[] =>
+    (sources ?? []).map((source) => {
+        const pattern = compilePattern(source);
+        if (pattern === undefined) {
+            throw new Error(`${source} is not a path pattern`);
+        }
+        return pattern;
+    });
 
 /** The category of the sync client's reports: namespaces, revisions, paths and counts, never values */
 const CATEGORY = "state-sync.client";
@@ -138,15 +167,21 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     const { namespace, bridge, transport, localStore } = options;
     const clientId = options.clientId ?? randomId();
     const backoff = options.backoff ?? defaultBackoff;
+    let localPatterns = patternsOf(options.local);
+    let secretPatterns = patternsOf(options.secret);
+    const isLocal = (path: string) => localPatterns.some((pattern) => patternCovers(pattern, path));
+    const isSecret = (path: string) => secretPatterns.some((pattern) => patternCovers(pattern, path));
 
     let confirmed: Store<any> = createStore({});
     let revision = 0;
     let outbox: OutboxEntry[] = [];
+    //the device's own changes at local paths, in order, one per path: laid over everything, never sent
+    let locals: LocalChange[] = [];
     //the requests the authority told this client of, by id
     let requests = new Map<string, SyncRequest>();
 
     //the parts changed since the last write to the local store
-    const dirty = { confirmed: false, outbox: false };
+    const dirty = { confirmed: false, outbox: false, local: false };
     let saveScheduled = false;
     let saveFailed = false;
 
@@ -213,7 +248,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         }
         const parts: [keyof typeof dirty, () => JsonValue][] = [
             ["confirmed", () => ({ state: copyJson(confirmed.get("$")), revision })],
-            ["outbox", () => outbox.map(({ change }) => copyJson(change))]
+            ["outbox", () => outbox.filter((entry) => entry.secret !== true).map(({ change }) => copyJson(change))],
+            ["local", () => copyJson<JsonValue>(locals as unknown as JsonValue)]
         ];
         let failed = false;
         for (const [part, value] of parts) {
@@ -280,6 +316,14 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         for (const { change } of outbox) {
             applyChange(scratch, change);
         }
+        for (const change of locals) {
+            try {
+                applyChange(scratch, change);
+            }
+            catch {
+                //its parent is gone from the shared state: it shows again when the parent does
+            }
+        }
         return copyJson(scratch.get("$"));
     };
 
@@ -345,6 +389,8 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
     const dropped = () => {
         report(CATEGORY, "The connection to the authority of %s closed", [namespace]);
         closeConnection();
+        //a secret goes to the authority only while online: what was not acked is not sent again
+        outbox = outbox.filter((entry) => entry.secret !== true);
         for (const entry of outbox) {
             entry.sent = false;
         }
@@ -447,6 +493,15 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         const { path } = entry.change;
         if (isReported(CATEGORY)) {
             report(CATEGORY, "The authority %s the change of %s at %s", [message.result, namespace, path]);
+        }
+        if (message.result === "passed" || entry.secret === true) {
+            //a secret went to server logic only: the confirmed state never holds it, even from an authority that took a revision for it
+            if (message.revision === revision + 1) {
+                revision = message.revision;
+                markDirty("confirmed");
+            }
+            reportStatus();
+            return;
         }
         if (message.result === "requested") {
             //kept as a request (sent as `requested`), so the shared state shows only what the owner applied
@@ -620,6 +675,18 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
             if (!isSyncPath(local.path) || isAtOrBelow(local.path, SERVER_PATH)) {
                 continue;
             }
+            if (isLocal(local.path)) {
+                locals = locals.filter((kept) => !isAtOrBelow(kept.path, local.path));
+                locals.push(copyJson<LocalChange>(local));
+                markDirty("local");
+                continue;
+            }
+            if (isSecret(local.path)) {
+                if (welcomed) {
+                    outbox.push({ change: { ...local, base: revision }, sent: false, secret: true });
+                }
+                continue;
+            }
             if (!transport) {
                 //standalone: the local store is the authority, so a change is confirmed at once
                 applyChange(confirmed, local);
@@ -663,6 +730,9 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
                 report(CATEGORY, "Ignoring a saved change of %s that is not valid", [namespace]);
             }
         }
+        const savedLocal = localStore.read(namespace, "local");
+        locals = (Array.isArray(savedLocal) ? savedLocal : []).filter((change): change is LocalChange & JsonValue =>
+            isRecord(change) && typeof change.path === "string" && isLocal(change.path) && (change.op === "set" || change.op === "delete" || change.op === "merge"));
         return { state: stored.state, revision: stored.revision, outbox: changes };
     };
 
@@ -723,7 +793,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         state: () => ({
             state: copyJson(confirmed.get("$")),
             revision,
-            outbox: outbox.map(({ change }) => copyJson<Change>(change))
+            outbox: outbox.filter((entry) => entry.secret !== true).map(({ change }) => copyJson<Change>(change))
         }),
         emit: (name, value) => {
             if (!welcomed) {
@@ -736,6 +806,19 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         requests: () => [...requests.values()].map((request) => copyJson<SyncRequest>(request)),
         approve: (id) => decide({ type: "approve", id }),
         reject: (id, note) => decide(note === undefined ? { type: "reject", id } : { type: "reject", id, note }),
-        withdraw: (id) => decide({ type: "withdraw", id })
+        withdraw: (id) => decide({ type: "withdraw", id }),
+        setPaths: (paths) => {
+            if (paths.local !== undefined) {
+                localPatterns = patternsOf(paths.local);
+                const kept = locals.filter((change) => isLocal(change.path));
+                if (kept.length !== locals.length) {
+                    locals = kept;
+                    markDirty("local");
+                }
+            }
+            if (paths.secret !== undefined) {
+                secretPatterns = patternsOf(paths.secret);
+            }
+        }
     };
 };

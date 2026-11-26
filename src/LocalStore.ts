@@ -5,11 +5,12 @@ import type { JsonValue } from "./Change.js";
  * - confirmed: the confirmed state and its revision, together, so they always match
  * - outbox: the changes waiting for the authority
  * - document: the app document, kept by the host
+ * - local: the changes at paths that stay on the device (`SyncClientOptions.local`)
  */
-export type LocalPart = "confirmed" | "outbox" | "document";
+export type LocalPart = "confirmed" | "outbox" | "document" | "local";
 
 /** Every part a namespace is kept in */
-export const LOCAL_PARTS: readonly LocalPart[] = ["confirmed", "outbox", "document"];
+export const LOCAL_PARTS: readonly LocalPart[] = ["confirmed", "outbox", "document", "local"];
 
 /** The port the sync client keeps its state in across reloads */
 export interface LocalStore {

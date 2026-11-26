@@ -47,7 +47,7 @@ interface RevisedChange extends Change { revision: number }   // accepted by the
 | `welcome` | authority | `namespace`, `revision`, exactly one of `changes` (since the client's revision) or `snapshot`, `durable` and `requests` |
 | `changes` | authority | `changes`: revised changes from other clients or server logic |
 | `change` | client | `change` |
-| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be; `requested`: kept as a request of the same id |
+| `ack` | authority | `id`, `result`: `applied` with `revision`; `adjusted` with `revision` and `value`; `rejected` with `reason` and a `code` (`REJECTION_CODES`: `unsaved`, `access`, `invalid`, `logic`, `unavailable`), which a client may show where the reason, possibly holding values, must not be; `requested`: kept as a request of the same id; `passed`: a change at a secret path went to server logic and nothing of it is kept |
 | `requested` | authority | `request` (`SyncRequest`): a new request, to its requester and to each client that may decide it |
 | `decided` | authority | `id`, `status` (`approved`, `rejected`, `expired`, `withdrawn`, `revoked`), `decidedAt`, optional `code` and `note` |
 | `approve`, `reject`, `withdraw` | client | `id`; `reject` takes an optional `note`. A decision the authority does not make is an `error`: `no-request`, `not-allowed` or `unsaved` |
@@ -183,6 +183,12 @@ client.start();
   `requested` and `decided`; `onRequests(requests)` is called with all of them as they are now, and
   `client.requests()` returns copies. `client.approve(id)`, `client.reject(id, note?)` and `client.withdraw(id)` send
   a decision when online and return `false` otherwise. An approved change arrives as any change does.
+- **Local and secret paths** (a node's `@local` and `@secret`, docs/design/state-definitions-and-instances.md).
+  `local: ["$.app.panel.open"]` keeps a change at or below a path on the device: it is never sent, it is kept in the
+  local store's `local` part, and it is laid over the confirmed state and outbox on every load. `secret` sends a
+  change only while online, drops it offline, and never writes it to the local store or the confirmed state; the
+  authority answers it `passed`. `client.setPaths({ local?, secret? })` replaces either list, for a host that learns
+  them from a document.
 
 ### Local store and Standalone
 
@@ -258,6 +264,10 @@ wss.on("connection", (socket) => {
   link is back), changes are held. Past `maxUnsaved` held changes (10000 by default) a client change is acked
   `rejected` with code `unsaved` and a server write throws (a `writeAll` batch is refused whole), until a save lands; ephemeral changes
   still pass. A refusal tries a failed save again, since a refused change starts no save.
+- **Secret paths.** `secret: ["$.app.password.value"]` (a node's `@secret`): a client change at or below one goes
+  through access and server logic as any change does, is acked `passed`, and reaches only the `onApplied` handlers.
+  It is never applied to the state, logged, pushed, saved or kept as a request, and a session that may only request
+  the path is refused.
 - `authority.revision()`, `authority.state()` (a copy, `$.server` included), `authority.get(path)` (a copy of one value)
   and `authority.close()` (closes every connection).
 

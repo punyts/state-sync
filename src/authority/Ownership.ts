@@ -182,7 +182,7 @@ export class ClaimPolicy {
  */
 export type WriteOutcome =
     | { readonly result: "applied" | "adjusted"; readonly revision: number; readonly epoch: number; readonly value?: JsonValue }
-    | { readonly result: "requested"; readonly epoch: number }
+    | { readonly result: "requested" | "passed"; readonly epoch: number }
     | { readonly result: "rejected"; readonly reason: string; readonly code?: RejectionCode };
 
 /** A write that waits in a handoff, with the access it came with */
@@ -548,7 +548,8 @@ export class OwnerNode implements NodePeer {
             case "rejected":
                 return { result: "rejected", reason: ack.reason ?? "rejected", ...(ack.code === undefined ? {} : { code: ack.code }) };
             case "requested":
-                return { result: "requested", epoch: hosted.epoch };
+            case "passed":
+                return { result: ack.result, epoch: hosted.epoch };
             default:
                 return { result: ack.result, revision: ack.revision ?? 0, epoch: hosted.epoch, ...(ack.value === undefined ? {} : { value: ack.value }) };
         }
